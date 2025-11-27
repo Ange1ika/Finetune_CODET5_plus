@@ -42,12 +42,15 @@ from transformers import (
     EarlyStoppingCallback,
 )
 
+# Import performance profiling utilities
+from profiling_utils import timing, print_timing_stats, reset_timing_stats
+
 # Execution Mode
 TEST_ONLY = False             # Set to True to only test existing model (no training)
 
 # Evaluation Settings
 # List of tasks to evaluate. Empty list = evaluate all tasks, or you can specify tasks like the following.
-EVAL_TASKS = ['code_summary', 'bug_detection', 'code_repair', 'code_generation', 'combined_repair']
+EVAL_TASKS = ['code_search', 'clone_detection', 'code_repair', 'test_generation']
 
 # ========================================
 # INSTRUCTION PREFIXES FOR EACH TASK
@@ -74,6 +77,7 @@ TASK_PREFIXES = {
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_ROOT = os.path.join(BASE_DIR, "..", "data")
 
+TEST_DATA_PATH = os.path.join(DATA_ROOT, "test_samples.json")  # Path to test data
 
 OUTPUT_DIR = "./fine_tuned_multitask_model"    # Where to save the trained model
 TEST_OUTPUT_DIR = "./output"                   # Where to save test results
@@ -81,8 +85,8 @@ MODEL_NAME = "Salesforce/codet5p-220m"         # Base model to fine-tune
 RANDOM_SEED = 42                               # For reproducible results
 
 # Training Settings
-TRAIN_BATCH_SIZE = 8           # Number of samples per training batch (reduce if out of memory)
-EVAL_BATCH_SIZE = 8            # Number of samples per validation batch
+TRAIN_BATCH_SIZE = 4           # Reduced to 4 to fit in GPU memory (effective batch = 8 with grad accum)
+EVAL_BATCH_SIZE = 4            # Reduced to 4 to fit in GPU memory
 LEARNING_RATE = 2e-5           # How fast the model learns (lower = more stable)
 NUM_EPOCHS = 20                # How many times to go through the entire dataset
 MAX_INPUT_LENGTH = 1024        # Maximum tokens for input text (code/descriptions)
@@ -104,6 +108,7 @@ GENERATION_NO_REPEAT_NGRAM_SIZE = 3
 
 
 
+@timing
 def read_jsonl(path):
     """
     Read a .jsonl file and yield one JSON object per line.
@@ -118,7 +123,7 @@ def read_jsonl(path):
                 continue
             yield json.loads(line)
             
-            
+@timing            
 def build_raw_examples_for_split(data_root: str, split: str):
     """
     Build unified raw examples for ALL tasks (code_search, clone_detection,
@@ -281,6 +286,7 @@ def build_raw_examples_for_split(data_root: str, split: str):
 
     return examples
 
+@timing
 def load_test_data(path):
     """Load test data from JSON file"""
     print(f"Loading test data from: {path}")
@@ -354,24 +360,19 @@ class MultiTaskDataset(Dataset):
             'labels': target_encoding['input_ids']
         }
 
+@timing
 def collate_fn(batch):
-    """Custom collate function to handle variable length sequences
+    """Custom collate function to handle variable length sequences - OPTIMIZED
     
     This function:
     - Pads input_ids and attention_mask with 0
     - Pads labels with -100 (so that they are ignored by the loss)
-    - Optionally keeps the list of task names for analysis
+    - Uses efficient tensor operations
     """
-    input_ids = [item['input_ids'] for item in batch]
-    attention_masks = [item['attention_mask'] for item in batch]
-    labels = [item['labels'] for item in batch]
-    
-
-    
-    # Convert to tensors and pad
-    input_ids = [torch.tensor(ids) if not isinstance(ids, torch.Tensor) else ids for ids in input_ids]
-    attention_masks = [torch.tensor(mask) if not isinstance(mask, torch.Tensor) else mask for mask in attention_masks]
-    labels = [torch.tensor(lbls) if not isinstance(lbls, torch.Tensor) else lbls for lbls in labels]
+    # Extract lists efficiently
+    input_ids = [torch.tensor(item['input_ids'], dtype=torch.long) if not isinstance(item['input_ids'], torch.Tensor) else item['input_ids'] for item in batch]
+    attention_masks = [torch.tensor(item['attention_mask'], dtype=torch.long) if not isinstance(item['attention_mask'], torch.Tensor) else item['attention_mask'] for item in batch]
+    labels = [torch.tensor(item['labels'], dtype=torch.long) if not isinstance(item['labels'], torch.Tensor) else item['labels'] for item in batch]
     
     # Pad sequences to the same length within the batch
     input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
@@ -384,6 +385,7 @@ def collate_fn(batch):
         'labels': labels,       
     }
 
+@timing
 def prepare_datasets(tokenizer, validation_size=VALIDATION_SIZE, seed=42):   
     """
     Build raw multi-task examples for 'train' and 'val' splits,
@@ -415,6 +417,7 @@ def prepare_datasets(tokenizer, validation_size=VALIDATION_SIZE, seed=42):
    
     return train_dataset, eval_dataset
 
+@timing
 def setup_model_and_tokenizer(model_name="Salesforce/codet5p-220m"):
     """Load and configure the model and tokenizer"""
     print(f"Loading model and tokenizer: {model_name}")
@@ -437,8 +440,13 @@ def setup_model_and_tokenizer(model_name="Salesforce/codet5p-220m"):
         model.resize_token_embeddings(len(tokenizer))
         print(f"Added {num_added} special tokens to vocabulary")
     
+    # Set use_cache=False to be compatible with gradient_checkpointing during training
+    # (Trainer will handle this, but setting it explicitly avoids the warning)
+    model.config.use_cache = False
+    
     return model, tokenizer
 
+@timing
 def train_model(
     model, 
     tokenizer, 
@@ -455,7 +463,23 @@ def train_model(
 ):
     """Train the multi-task model using Hugging Face Trainer"""
     
-    # Configure training parameters
+    """
+    OPTIMIZATIONS:
+    - Uses pin_memory for faster GPU transfers (if CUDA available)
+    - Sets num_workers for parallel data loading
+    - Enables gradient accumulation for larger effective batch sizes
+    - Uses mixed precision training (fp16) for speed
+    - Gradient checkpointing enabled to reduce memory usage
+    - Smaller batch size with higher gradient accumulation
+    """
+    
+    # Determine optimal number of workers for data loading
+    num_workers = 2 if torch.cuda.is_available() else 0  # Reduced to 2 to save memory
+    use_pin_memory = torch.cuda.is_available()  # Pin memory for faster GPU transfers
+    
+    print(f"Data loading optimization: num_workers={num_workers}, pin_memory={use_pin_memory}")
+    
+    # OPTIMIZATION: Configure optimal training parameters for GPU
     training_args = TrainingArguments(
         output_dir=output_dir,
         eval_strategy="steps",
@@ -474,10 +498,28 @@ def train_model(
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         save_total_limit=3,
-        dataloader_pin_memory=False,
+        # OPTIMIZATION: Data loading optimizations
+        dataloader_pin_memory=use_pin_memory,  # Pin memory for faster CPU->GPU transfer
+        dataloader_num_workers=num_workers,     # Parallel data loading (reduced to 2 for memory)
+        dataloader_prefetch_factor=2 if num_workers > 0 else None,  # Prefetch 2 batches
+        # OPTIMIZATION: GPU transfer optimizations
+        dataloader_persistent_workers=True if num_workers > 0 else False,  # Keep workers alive
+        ddp_find_unused_parameters=False if torch.cuda.is_available() else None,  # Skip unused param check
+        # OPTIMIZATION: Training optimizations
         remove_unused_columns=False,
         prediction_loss_only=True,
-        fp16=torch.cuda.is_available(),  # Mixed precision if GPU available
+        fp16=torch.cuda.is_available(),  # Mixed precision for speed
+        fp16_full_eval=torch.cuda.is_available(),  # FP16 for eval too
+        gradient_accumulation_steps=4,  # Increased to 4 (effective batch = 16 with batch_size=4)
+        # OPTIMIZATION: Memory and compute efficiency
+        gradient_checkpointing=True,  # ENABLED to save memory at cost of compute
+        optim="adamw_torch_fused",  # Fused AdamW (faster than regular adamw_torch)
+        group_by_length=False,  # Could enable for variable length sequences
+        # OPTIMIZATION: Additional speedups
+        torch_compile=False,  # Keep disabled for Trainer compatibility
+        max_grad_norm=1.0,  # Gradient clipping for stability
+        lr_scheduler_type="cosine",  # Cosine scheduler often converges faster
+        auto_find_batch_size=False,  # Disable to avoid overhead
     )
     
     # Setup early stopping callback
@@ -518,8 +560,12 @@ def train_model(
     
     return trainer, train_result
 
+@timing
 def generate_response(text, tokenizer, model, device, task_type="general"):
-    """Generate response for given input text"""
+    """Generate response for given input text
+    
+    OPTIMIZATION: Efficient GPU transfers and inference with minimal overhead
+    """
     inputs = tokenizer(
         text,
         padding=True,
@@ -527,9 +573,12 @@ def generate_response(text, tokenizer, model, device, task_type="general"):
         return_tensors="pt",
         max_length=MAX_INPUT_LENGTH
     )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
     
-    with torch.no_grad():
+    # OPTIMIZATION: Non-blocking transfer for async CPU->GPU copy
+    inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
+    
+    # OPTIMIZATION: Disable gradients and use inference mode for faster execution
+    with torch.inference_mode():  # More efficient than no_grad() for inference
         outputs = model.generate(
             **inputs,
             max_length=GENERATION_MAX_LENGTH,
@@ -542,6 +591,7 @@ def generate_response(text, tokenizer, model, device, task_type="general"):
             do_sample=False,  # Use beam search for better quality
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,  # OPTIMIZATION: Enable KV cache for faster generation (OK during inference)
         )
     
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -919,6 +969,7 @@ def evaluate_task_results(task_name, results):
     
     return metrics
 
+@timing
 def test_multitask_model(model, tokenizer, device, test_samples=None):
     """Test the trained model on all test samples"""
     
@@ -1181,6 +1232,12 @@ def main():
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print("Using CUDA GPU for training")
+        # OPTIMIZATION: Enable TF32 for faster matmul on Ampere+ GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # OPTIMIZATION: Enable cudnn benchmarking for optimal convolution algorithms
+        torch.backends.cudnn.benchmark = True
+        print("✓ GPU optimizations enabled (TF32, cuDNN benchmark)")
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
         print("Using Apple Silicon MPS for training")
@@ -1190,7 +1247,13 @@ def main():
     
     # Load model and tokenizer
     model, tokenizer = setup_model_and_tokenizer(MODEL_NAME)
-    model.to(device)
+    
+    # OPTIMIZATION: Move model to device with non_blocking for async transfer
+    if torch.cuda.is_available():
+        model = model.to(device, non_blocking=True)
+        print("✓ Model moved to GPU with non-blocking transfer")
+    else:
+        model = model.to(device)
     
     if TEST_ONLY:
         # Only test existing model
@@ -1198,7 +1261,10 @@ def main():
         if os.path.exists(OUTPUT_DIR):
             model = T5ForConditionalGeneration.from_pretrained(OUTPUT_DIR)
             tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR)
-            model.to(device)
+            if torch.cuda.is_available():
+                model = model.to(device, non_blocking=True)
+            else:
+                model = model.to(device)
             test_multitask_model(model, tokenizer, device)
         else:
             print(f"Error: Model directory {OUTPUT_DIR} not found")
@@ -1253,6 +1319,9 @@ def main():
     print(f"Validation samples: {len(eval_dataset)}")
     print(f"Final training loss: {train_result.training_loss:.4f}")
     print("="*60)
+    
+    # Print performance profiling results
+    print_timing_stats()
 
 if __name__ == "__main__":
     main()
