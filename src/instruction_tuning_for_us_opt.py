@@ -1,0 +1,1327 @@
+"""
+Multi-Task Instruction Tuning for CodeT5+
+
+This script provides a simple, configurable multi-task instruction tuning framework for CodeT5+.
+All configuration is done by editing the constants below - no command line arguments needed.
+
+Tasks supported:
+1. Code Summarization: "summarize code:" + code -> description
+2. Bug Detection: "is it buggy:" + code -> True/False  
+3. Code Repair: "fix a bug:" + buggy_code -> fixed_code
+4. Code Generation: "generate code:" + description -> code
+5. Combined Bug Fix: "fix a bug if it is buggy:" + code -> analysis + fix
+
+USAGE:
+1. Edit the configuration constants below to match your needs
+2. Run: python instruction_tuning.py
+3. The script will automatically train and test the model
+
+CONFIGURATION:
+- Edit DATA_PATH to point to your dataset
+- Adjust training parameters (epochs, batch size, learning rate)
+- Set TEST_ONLY = True to test an existing model without training
+- All paths and parameters can be customized below
+"""
+
+import json
+import os
+import random
+import signal
+from datetime import datetime
+from collections import Counter
+from torch.utils.data import Dataset
+
+import torch
+from torch.utils.data import Dataset, Subset
+import numpy as np
+from transformers import (
+    AutoTokenizer, 
+    T5ForConditionalGeneration, 
+    Trainer, 
+    TrainingArguments,
+    EarlyStoppingCallback,
+)
+
+# Import performance profiling utilities
+from profiling_utils import timing, print_timing_stats, reset_timing_stats
+
+# Execution Mode
+TEST_ONLY = False             # Set to True to only test existing model (no training)
+
+# Evaluation Settings
+# List of tasks to evaluate. Empty list = evaluate all tasks, or you can specify tasks like the following.
+EVAL_TASKS = ['code_search', 'clone_detection', 'code_repair', 'test_generation']
+
+# ========================================
+# INSTRUCTION PREFIXES FOR EACH TASK
+# ========================================
+TASK_PREFIXES = {
+    # Code Search: query + candidate code snippets -> index (0/1/2)
+    "code_search": "code search: choose the correct code snippet index for the given query.",
+
+    # Clone Detection: (source code, target code) -> 0/1
+    "clone_detection": "clone detection: decide whether the two code snippets are semantically equivalent. Answer 1 if they are clones, otherwise 0.",
+
+    # Code Repair: buggy code -> fixed code
+    "code_repair": "fix a bug: return ONLY the fixed code without any explanation.",
+
+    # Test Generation: code under test -> test code
+    "test_generation": "generate tests: write unit tests for the given code."
+}
+
+# ========================================
+# CONFIGURATION - EDIT THESE VALUES
+# ========================================
+
+# Data and Model Settings
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_ROOT = os.path.join(BASE_DIR, "..", "data")
+
+TEST_DATA_PATH = os.path.join(DATA_ROOT, "test_samples.json")  # Path to test data
+
+OUTPUT_DIR = "./fine_tuned_multitask_model"    # Where to save the trained model
+TEST_OUTPUT_DIR = "./output"                   # Where to save test results
+MODEL_NAME = "Salesforce/codet5p-220m"         # Base model to fine-tune
+RANDOM_SEED = 42                               # For reproducible results
+
+# Training Settings
+TRAIN_BATCH_SIZE = 4           # Reduced to 4 to fit in GPU memory (effective batch = 8 with grad accum)
+EVAL_BATCH_SIZE = 4            # Reduced to 4 to fit in GPU memory
+LEARNING_RATE = 2e-5           # How fast the model learns (lower = more stable)
+NUM_EPOCHS = 20                # How many times to go through the entire dataset
+MAX_INPUT_LENGTH = 1024        # Maximum tokens for input text (code/descriptions)
+MAX_TARGET_LENGTH = 512        # Maximum tokens for output text
+
+# Validation and Early Stopping
+EARLY_STOPPING_PATIENCE = 3   # Stop training if no improvement for this many evaluations
+EVAL_STEPS = 300              # Evaluate model performance every N training steps
+SAVE_STEPS = 300              # Save model checkpoint every N steps
+VALIDATION_SIZE = 0         # Number of samples to use for validation
+
+# Text Generation Settings (for inference/testing)
+GENERATION_MAX_LENGTH = 512
+GENERATION_MIN_LENGTH = 10
+GENERATION_NUM_BEAMS = 4
+GENERATION_LENGTH_PENALTY = 0.8
+GENERATION_REPETITION_PENALTY = 1.1
+GENERATION_NO_REPEAT_NGRAM_SIZE = 3
+
+
+
+@timing
+def read_jsonl(path):
+    """
+    Read a .jsonl file and yield one JSON object per line.
+
+    Each line in the file is a valid JSON object.
+    This function ignores empty lines.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            yield json.loads(line)
+            
+@timing            
+def build_raw_examples_for_split(data_root: str, split: str):
+    """
+    Build unified raw examples for ALL tasks (code_search, clone_detection,
+    code_repair, test_generation) for a given split (train/val/test).
+
+    Each returned example has the unified schema:
+        {
+            "task":   <task_name>,           # e.g., "code_search"
+            "input":  <string prompt>,       # full natural language input to the model
+            "output": <string target>,       # expected output text
+        }
+
+    This function is the ONLY place that knows about the original JSON structure
+    of codesearch/clone/repair/test_gen.
+    """
+    examples = []
+
+    # -------------------------
+    # 1) CODE SEARCH
+    # -------------------------
+    cs_dir = os.path.join(data_root, "codesearch")
+    cs_path = os.path.join(cs_dir, f"{split}.jsonl")
+    if os.path.exists(cs_path):
+        for item in read_jsonl(cs_path):
+            # Example structure (given by you):
+            # {
+            #   "task": "SEARCH",
+            #   "input": "<natural language query>",
+            #   "output": "<gold code snippet>",  # not strictly needed for index prediction
+            #   "choices": [code0, code1, code2],
+            #   "answer": 1,                      # correct index
+            #   ...
+            # }
+
+            query = item["input"]
+            choices = item["choices"]
+            answer_idx = int(item["answer"])
+
+            # Build a text prompt that includes query + candidate code snippets.
+            # The model is asked to output the index (0, 1 or 2).
+            choice_lines = []
+            for i, code in enumerate(choices):
+                choice_lines.append(f"[{i}] {code}")
+
+            prompt = (
+                f"{TASK_PREFIXES['code_search']}\n\n"
+                f"Query:\n{query}\n\n"
+                "Candidate code snippets:\n"
+                + "\n\n".join(choice_lines)
+                + "\n\nAnswer with the index (0, 1, or 2):"
+            )
+
+            examples.append(
+                {
+                    "task": "code_search",
+                    "input": prompt,
+                    "output": str(answer_idx),
+                }
+            )
+
+    # -------------------------
+    # 2) CLONE DETECTION
+    # -------------------------
+    clone_dir = os.path.join(data_root, "clone")
+    clone_path = os.path.join(clone_dir, f"{split}.jsonl")
+    if os.path.exists(clone_path):
+        for item in read_jsonl(clone_path):
+            # Example structure (given by you):
+            # {
+            #   "task": "CLONE",
+            #   "source": "<source code>",
+            #   "target": "<target code>",
+            #   "label": 0 or 1,
+            #   ...
+            # }
+
+            src_code = item["source"]
+            tgt_code = item["target"]
+            label = int(item["label"])  # 0 or 1
+
+            prompt = (
+                f"{TASK_PREFIXES['clone_detection']}\n\n"
+                "SOURCE CODE:\n"
+                f"{src_code}\n\n"
+                "TARGET CODE:\n"
+                f"{tgt_code}\n\n"
+                "Answer with 1 (clone) or 0 (not clone)."
+            )
+
+            examples.append(
+                {
+                    "task": "clone_detection",
+                    "input": prompt,
+                    "output": str(label),
+                }
+            )
+
+    # -------------------------
+    # 3) CODE REPAIR
+    # -------------------------
+    repair_dir = os.path.join(data_root, "repair")
+    repair_path = os.path.join(repair_dir, f"{split}.jsonl")
+    # NOTE: right now you have "all.jsonl". You can create train/val/test splits,
+    # or temporarily symlink/copy "all.jsonl" to "train.jsonl".
+    if os.path.exists(repair_path):
+        for item in read_jsonl(repair_path):
+            # Example structure (given by you):
+            # {
+            #   "task": "repair",
+            #   "input": "<buggy code>",
+            #   "output": "<fixed code>",
+            #   ...
+            # }
+
+            buggy_code = item["input"]
+            fixed_code = item["output"]
+
+            prompt = f"{TASK_PREFIXES['code_repair']} {buggy_code}"
+
+            examples.append(
+                {
+                    "task": "code_repair",
+                    "input": prompt,
+                    "output": fixed_code,
+                }
+            )
+
+    # -------------------------
+    # 4) TEST GENERATION
+    # -------------------------
+    tg_dir = os.path.join(data_root, "test_gen")
+    tg_path = os.path.join(tg_dir, f"{split}.jsonl")
+    if os.path.exists(tg_path):
+        for item in read_jsonl(tg_path):
+            # Example structure (given by you):
+            # {
+            #   "task": "TEST_GENERATION",
+            #   "source": "<code under test>",
+            #   "target": "<test code>",
+            #   ...
+            # }
+
+            code_under_test = item["source"]
+            test_code = item["target"]
+
+            prompt = (
+                f"{TASK_PREFIXES['test_generation']}\n\n"
+                "CODE UNDER TEST:\n"
+                f"{code_under_test}\n\n"
+                "Write unit tests:"
+            )
+
+            examples.append(
+                {
+                    "task": "test_generation",
+                    "input": prompt,
+                    "output": test_code,
+                }
+            )
+
+    return examples
+
+@timing
+def load_test_data(path):
+    """Load test data from JSON file"""
+    print(f"Loading test data from: {path}")
+    with open(path, 'r', encoding='utf-8') as f:
+        test_dataset = json.load(f)
+    
+    test_samples = test_dataset.get('test_samples', [])
+    metadata = test_dataset.get('metadata', {})
+    
+    print(f"Loaded {len(test_samples)} test samples")
+    if metadata:
+        print(f"Task distribution: {metadata.get('task_distribution', {})}")
+    
+    return test_samples
+
+class MultiTaskDataset(Dataset):
+    """
+    Dataset class for multi-task instruction tuning.
+    
+    Creates training examples for all 5 tasks from each data item:
+    - code_search
+    - clone_detection
+    - code_repair
+    - test_generation
+    
+    Each element of `data` is a dict:
+        {"task": <task_name>, "input": <input_text>, "output": <target_text>}
+    """
+    
+    
+    
+    def __init__(self, data, tokenizer, max_input_length=512, max_target_length=512):
+        self.tokenizer = tokenizer
+        self.max_input_length = max_input_length
+        self.max_target_length = max_target_length
+        
+        self.examples = data
+        
+        print(f"Created {len(self.examples)} training examples from {len(data)} data items")
+        
+    
+    
+    def __len__(self):
+        return len(self.examples)
+    
+    def __getitem__(self, idx):
+        example = self.examples[idx]
+        
+        # Tokenize input
+        input_encoding = self.tokenizer(
+            example['input'],
+            max_length=self.max_input_length,
+            padding=False,  # Let collate_fn handle padding
+            truncation=True,
+            return_tensors=None
+        )
+        
+        # Tokenize target
+        target_encoding = self.tokenizer(
+            example['output'],
+            max_length=self.max_target_length,
+            padding=False,  # Let collate_fn handle padding
+            truncation=True,
+            return_tensors=None
+        )
+        
+        return {
+            "task": example["task"], 
+            'input_ids': input_encoding['input_ids'],
+            'attention_mask': input_encoding['attention_mask'],
+            'labels': target_encoding['input_ids']
+        }
+
+@timing
+def collate_fn(batch):
+    """Custom collate function to handle variable length sequences - OPTIMIZED
+    
+    This function:
+    - Pads input_ids and attention_mask with 0
+    - Pads labels with -100 (so that they are ignored by the loss)
+    - Uses efficient tensor operations
+    """
+    # Extract lists efficiently
+    input_ids = [torch.tensor(item['input_ids'], dtype=torch.long) if not isinstance(item['input_ids'], torch.Tensor) else item['input_ids'] for item in batch]
+    attention_masks = [torch.tensor(item['attention_mask'], dtype=torch.long) if not isinstance(item['attention_mask'], torch.Tensor) else item['attention_mask'] for item in batch]
+    labels = [torch.tensor(item['labels'], dtype=torch.long) if not isinstance(item['labels'], torch.Tensor) else item['labels'] for item in batch]
+    
+    # Pad sequences to the same length within the batch
+    input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
+    attention_masks = torch.nn.utils.rnn.pad_sequence(attention_masks, batch_first=True, padding_value=0)
+    labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
+    
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_masks,
+        'labels': labels,       
+    }
+
+@timing
+def prepare_datasets(tokenizer, validation_size=VALIDATION_SIZE, seed=42):   
+    """
+    Build raw multi-task examples for 'train' and 'val' splits,
+    then wrap them into MultiTaskDataset objects.
+
+    NOTE:
+    - We rely on build_raw_examples_for_split() to mix tasks.
+    - Here we can still subsample for validation if needed.
+    """
+    
+    # Build raw examples per split
+    train_raw = build_raw_examples_for_split(DATA_ROOT, "train")
+    val_raw = build_raw_examples_for_split(DATA_ROOT, "val")    
+    
+    random.seed(seed)
+    random.shuffle(train_raw)
+    random.shuffle(val_raw)
+    
+    # Optionally cut validation size if you want smaller val set
+    if 0 < validation_size < len(val_raw):
+        val_raw = val_raw[:validation_size]
+        
+    
+    # Create dataset
+    train_dataset = MultiTaskDataset(train_raw, tokenizer, MAX_INPUT_LENGTH, MAX_TARGET_LENGTH)
+    eval_dataset = MultiTaskDataset(val_raw, tokenizer, MAX_INPUT_LENGTH, MAX_TARGET_LENGTH)
+
+    print(f"Dataset split: {len(train_dataset)} training, {len(eval_dataset)} validation samples")
+   
+    return train_dataset, eval_dataset
+
+@timing
+def setup_model_and_tokenizer(model_name="Salesforce/codet5p-220m"):
+    """Load and configure the model and tokenizer"""
+    print(f"Loading model and tokenizer: {model_name}")
+    
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = T5ForConditionalGeneration.from_pretrained(model_name, trust_remote_code=True)
+    
+    # Add special tokens that might be useful for code tasks
+    special_tokens = {
+        "additional_special_tokens": [
+            "<code>", "</code>", 
+            "<bug>", "</bug>",
+            "<fix>", "</fix>",
+            "<summary>", "</summary>"
+        ]
+    }
+    
+    num_added = tokenizer.add_special_tokens(special_tokens)
+    if num_added > 0:
+        model.resize_token_embeddings(len(tokenizer))
+        print(f"Added {num_added} special tokens to vocabulary")
+    
+    # Set use_cache=False to be compatible with gradient_checkpointing during training
+    # (Trainer will handle this, but setting it explicitly avoids the warning)
+    model.config.use_cache = False
+    
+    return model, tokenizer
+
+@timing
+def train_model(
+    model, 
+    tokenizer, 
+    train_dataset, 
+    eval_dataset, 
+    device, 
+    output_dir="./fine_tuned_multitask_model",
+    num_epochs=NUM_EPOCHS,
+    batch_size=TRAIN_BATCH_SIZE,
+    learning_rate=LEARNING_RATE,
+    eval_steps=EVAL_STEPS,
+    save_steps=SAVE_STEPS,
+    early_stopping_patience=EARLY_STOPPING_PATIENCE
+):
+    """Train the multi-task model using Hugging Face Trainer"""
+    
+    """
+    OPTIMIZATIONS:
+    - Uses pin_memory for faster GPU transfers (if CUDA available)
+    - Sets num_workers for parallel data loading
+    - Enables gradient accumulation for larger effective batch sizes
+    - Uses mixed precision training (fp16) for speed
+    - Gradient checkpointing enabled to reduce memory usage
+    - Smaller batch size with higher gradient accumulation
+    """
+    
+    # Determine optimal number of workers for data loading
+    num_workers = 2 if torch.cuda.is_available() else 0  # Reduced to 2 to save memory
+    use_pin_memory = torch.cuda.is_available()  # Pin memory for faster GPU transfers
+    
+    print(f"Data loading optimization: num_workers={num_workers}, pin_memory={use_pin_memory}")
+    
+    # OPTIMIZATION: Configure optimal training parameters for GPU
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        eval_strategy="steps",
+        eval_steps=eval_steps,
+        save_steps=save_steps,
+        save_strategy="steps",
+        learning_rate=learning_rate,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        num_train_epochs=num_epochs,
+        weight_decay=0.01,
+        warmup_steps=300,
+        logging_dir=f"{output_dir}/logs",
+        logging_steps=100,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        save_total_limit=3,
+        # OPTIMIZATION: Data loading optimizations
+        dataloader_pin_memory=use_pin_memory,  # Pin memory for faster CPU->GPU transfer
+        dataloader_num_workers=num_workers,     # Parallel data loading (reduced to 2 for memory)
+        dataloader_prefetch_factor=2 if num_workers > 0 else None,  # Prefetch 2 batches
+        # OPTIMIZATION: GPU transfer optimizations
+        dataloader_persistent_workers=True if num_workers > 0 else False,  # Keep workers alive
+        ddp_find_unused_parameters=False if torch.cuda.is_available() else None,  # Skip unused param check
+        # OPTIMIZATION: Training optimizations
+        remove_unused_columns=False,
+        prediction_loss_only=True,
+        fp16=torch.cuda.is_available(),  # Mixed precision for speed
+        fp16_full_eval=torch.cuda.is_available(),  # FP16 for eval too
+        gradient_accumulation_steps=4,  # Increased to 4 (effective batch = 16 with batch_size=4)
+        # OPTIMIZATION: Memory and compute efficiency
+        gradient_checkpointing=True,  # ENABLED to save memory at cost of compute
+        optim="adamw_torch_fused",  # Fused AdamW (faster than regular adamw_torch)
+        group_by_length=False,  # Could enable for variable length sequences
+        # OPTIMIZATION: Additional speedups
+        torch_compile=False,  # Keep disabled for Trainer compatibility
+        max_grad_norm=1.0,  # Gradient clipping for stability
+        lr_scheduler_type="cosine",  # Cosine scheduler often converges faster
+        auto_find_batch_size=False,  # Disable to avoid overhead
+    )
+    
+    # Setup early stopping callback
+    early_stopping = EarlyStoppingCallback(
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_threshold=0.001
+    )
+    
+    # Initialize trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=collate_fn,
+        callbacks=[early_stopping],
+    )
+    
+    print("\n" + "="*60)
+    print("STARTING MULTI-TASK TRAINING")
+    print("="*60)
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(eval_dataset)}")
+    print(f"Max epochs: {num_epochs}")
+    print(f"Batch size: {batch_size}")
+    print(f"Learning rate: {learning_rate}")
+    print("="*60)
+    
+    # Train the model
+    train_result = trainer.train()
+    
+    # Save the final model
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    
+    print(f"\nTraining completed! Model saved to: {output_dir}")
+    print(f"Final training loss: {train_result.training_loss:.4f}")
+    
+    return trainer, train_result
+
+@timing
+def generate_response(text, tokenizer, model, device, task_type="general"):
+    """Generate response for given input text
+    
+    OPTIMIZATION: Efficient GPU transfers and inference with minimal overhead
+    """
+    inputs = tokenizer(
+        text,
+        padding=True,
+        truncation=True,
+        return_tensors="pt",
+        max_length=MAX_INPUT_LENGTH
+    )
+    
+    # OPTIMIZATION: Non-blocking transfer for async CPU->GPU copy
+    inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
+    
+    # OPTIMIZATION: Disable gradients and use inference mode for faster execution
+    with torch.inference_mode():  # More efficient than no_grad() for inference
+        outputs = model.generate(
+            **inputs,
+            max_length=GENERATION_MAX_LENGTH,
+            min_length=GENERATION_MIN_LENGTH,
+            num_beams=GENERATION_NUM_BEAMS,
+            length_penalty=GENERATION_LENGTH_PENALTY,
+            repetition_penalty=GENERATION_REPETITION_PENALTY,
+            no_repeat_ngram_size=GENERATION_NO_REPEAT_NGRAM_SIZE,
+            early_stopping=True,
+            do_sample=False,  # Use beam search for better quality
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,  # OPTIMIZATION: Enable KV cache for faster generation (OK during inference)
+        )
+    
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return response.strip()
+
+def calculate_bleu_score(reference, candidate, max_n=4):
+    """Calculate BLEU-4 score with multiple n-grams (standard for code summarization)"""
+    ref_words = reference.lower().split()
+    cand_words = candidate.lower().split()
+    
+    if not cand_words or not ref_words:
+        return 0.0
+    
+    # Calculate precision for each n-gram level (1 to 4)
+    precisions = []
+    
+    for n in range(1, max_n + 1):
+        if len(cand_words) < n:
+            precisions.append(0.0)
+            continue
+            
+        # Generate n-grams
+        ref_ngrams = [tuple(ref_words[i:i+n]) for i in range(len(ref_words) - n + 1)]
+        cand_ngrams = [tuple(cand_words[i:i+n]) for i in range(len(cand_words) - n + 1)]
+        
+        if not cand_ngrams:
+            precisions.append(0.0)
+            continue
+        
+        # Count overlaps
+        ref_counter = Counter(ref_ngrams)
+        cand_counter = Counter(cand_ngrams)
+        
+        overlap = sum((cand_counter & ref_counter).values())
+        precision = overlap / len(cand_ngrams)
+        precisions.append(precision)
+    
+    # Brevity penalty
+    bp = 1.0
+    if len(cand_words) < len(ref_words):
+        bp = np.exp(1 - len(ref_words) / len(cand_words))
+    
+    # Geometric mean of precisions (BLEU-4 formula)
+    if all(p > 0 for p in precisions):
+        score = bp * np.exp(np.mean(np.log(precisions)))
+    else:
+        score = 0.0
+    
+    return score
+
+def calculate_rouge_l(reference, candidate):
+    """Calculate ROUGE-L score (longest common subsequence)"""
+    ref_words = reference.lower().split()
+    cand_words = candidate.lower().split()
+    
+    if not ref_words or not cand_words:
+        return 0.0
+    
+    # Dynamic programming for LCS
+    m, n = len(ref_words), len(cand_words)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if ref_words[i-1] == cand_words[j-1]:
+                dp[i][j] = dp[i-1][j-1] + 1
+            else:
+                dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+    
+    lcs_length = dp[m][n]
+    
+    # ROUGE-L F1 score
+    if lcs_length == 0:
+        return 0.0
+    
+    recall = lcs_length / len(ref_words)
+    precision = lcs_length / len(cand_words)
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    return f1
+
+def timeout_handler(signum, frame):
+    """Handler for timeout signal."""
+    raise TimeoutError("Operation timed out")
+
+def execute_code_safely(code, timeout=5):
+    """Execute Python code safely with timeout protection and return success status"""
+    try:
+        # Set up timeout signal (2 seconds for consistency with code_generation_finetuning.py)
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(2)  # 2 second timeout
+        
+        try:
+            # Create a clean namespace for execution
+            namespace = {}
+            
+            # Execute the code in the namespace
+            exec(code, namespace)
+            
+            return True, "", ""
+        finally:
+            # Always clean up the alarm
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+            
+    except TimeoutError:
+        return False, "", "Code execution timeout (possible infinite loop)"
+    except Exception as e:
+        return False, "", str(e)
+
+def evaluate_code_repair(fixed_code, expected_code=None):
+    """
+    Evaluate code repair using execution-based testing (Pass@1)
+    Returns: (execution_success, syntax_valid, similarity_score)
+    """
+    # Check syntax validity
+    try:
+        compile(fixed_code, '<string>', 'exec')
+        syntax_valid = True
+    except SyntaxError:
+        syntax_valid = False
+    
+    # Test execution
+    execution_success, stdout, stderr = execute_code_safely(fixed_code)
+    
+    # Calculate similarity to expected if available
+    similarity_score = 0.0
+    if expected_code:
+        similarity_score = calculate_rouge_l(expected_code, fixed_code)
+    
+    return execution_success, syntax_valid, similarity_score
+
+def evaluate_bug_detection(prediction, expected):
+    """Evaluate bug detection accuracy"""
+    # Normalize predictions
+    pred_normalized = prediction.lower().strip()
+    expected_normalized = expected.lower().strip()
+    
+    # Check if prediction contains "True" or "False"
+    if pred_normalized.startswith("true"):
+        pred_bool = True
+    elif pred_normalized.startswith("false"):
+        pred_bool = False
+    else:
+        # If unclear, consider it wrong
+        return False
+    
+    expected_bool = expected_normalized == "true"
+    return pred_bool == expected_bool
+
+def evaluate_code_generation(generated_code, expected_output=None, description=None):
+    """
+    Evaluate code generation using execution and syntax checking
+    Returns: (execution_success, syntax_valid, functionality_score)
+    """
+    # Check syntax validity
+    try:
+        compile(generated_code, '<string>', 'exec')
+        syntax_valid = True
+    except SyntaxError:
+        syntax_valid = False
+    
+    # Test execution
+    execution_success, stdout, stderr = execute_code_safely(generated_code)
+    
+    # Calculate functionality score based on expected output or description
+    functionality_score = 0.0
+    if expected_output:
+        functionality_score = calculate_rouge_l(expected_output, generated_code)
+    elif description:
+        # Simple keyword matching for functionality
+        desc_keywords = set(description.lower().split())
+        code_words = set(generated_code.lower().split())
+        common_keywords = desc_keywords & code_words
+        if desc_keywords:
+            functionality_score = len(common_keywords) / len(desc_keywords)
+    
+    return execution_success, syntax_valid, functionality_score
+
+def evaluate_single_result(task_name, result):
+    """Evaluate a single result and return correctness status and score"""
+    expected = result['expected_output']
+    generated = result['model_output']
+    
+    if task_name == 'code_summary':
+        bleu_score = calculate_bleu_score(expected, generated)
+        # Research-based threshold: BLEU-4 > 0.15
+        is_correct = bleu_score > 0.15
+        score = bleu_score
+        
+    elif task_name == 'bug_detection':
+        is_correct = evaluate_bug_detection(generated, expected)
+        score = 1.0 if is_correct else 0.0
+        
+    elif task_name in ['code_repair', 'combined_repair']:
+        skip_exec = False
+        
+        # Extract just the code part for combined_repair
+        if task_name == 'combined_repair' and 'Fixed code:' in generated:
+            code_part = generated.split('Fixed code:', 1)[1].strip()
+        elif task_name == 'combined_repair' and 'No, the code is not buggy.' in generated:
+            skip_exec = True
+            score = calculate_rouge_l(generated, expected)
+        else:
+            code_part = generated
+        
+        if skip_exec:
+            execution_success = True
+            syntax_valid = True                
+        else:
+            execution_success, syntax_valid, score = evaluate_code_repair(
+               code_part, expected
+            )
+        
+        is_correct = syntax_valid and execution_success
+        
+    elif task_name == 'code_generation':
+        execution_success, syntax_valid, score = evaluate_code_generation(
+            generated, expected
+        )
+        is_correct = syntax_valid and execution_success
+        
+    else:
+        is_correct = False
+        score = 0.0
+    
+    return is_correct, score
+
+def evaluate_task_results(task_name, results):
+    """Evaluate results for a specific task and return metrics"""
+    if not results:
+        return {}
+    
+    metrics = {
+        'total_samples': len(results),
+        'success_rate': 0.0,
+        'avg_score': 0.0,
+        'additional_metrics': {}
+    }
+    
+    successful_samples = 0
+    total_score = 0.0
+    
+    if task_name == 'code_summary':
+        # Evaluate using BLEU and ROUGE-L scores
+        # Primary metric: BLEU-4 (standard for code summarization)
+        bleu_scores = []
+        rouge_scores = []
+        
+        for result in results:
+            expected = result['expected_output']
+            generated = result['model_output']
+            
+            bleu_score = calculate_bleu_score(expected, generated)
+            rouge_score = calculate_rouge_l(expected, generated)
+            
+            bleu_scores.append(bleu_score)
+            rouge_scores.append(rouge_score)
+            
+            # Research-based threshold: BLEU-4 > 0.15 (based on CodeT5/CodeBERT literature)
+            if bleu_score > 0.15:
+                successful_samples += 1
+            
+            total_score += bleu_score  # Use BLEU as primary scoring metric
+        
+        metrics['additional_metrics'] = {
+            'avg_bleu_score': round(np.mean(bleu_scores), 3),
+            'avg_rouge_l': round(np.mean(rouge_scores), 3),
+            'max_bleu_score': round(max(bleu_scores), 3),
+            'min_bleu_score': round(min(bleu_scores), 3),
+            'bleu_above_015': sum(1 for s in bleu_scores if s > 0.15),
+            'bleu_above_025': sum(1 for s in bleu_scores if s > 0.25),  # High quality threshold
+            'success_threshold': 0.15
+        }
+        
+    elif task_name == 'bug_detection':
+        # Evaluate using accuracy
+        correct_predictions = 0
+        
+        for result in results:
+            expected = result['expected_output']
+            predicted = result['model_output']
+            
+            is_correct = evaluate_bug_detection(predicted, expected)
+            if is_correct:
+                correct_predictions += 1
+                successful_samples += 1
+            
+            total_score += 1.0 if is_correct else 0.0
+        
+        metrics['additional_metrics'] = {
+            'accuracy': round(correct_predictions / len(results), 3),
+            'correct_predictions': correct_predictions
+        }
+        
+    elif task_name in ['code_repair', 'combined_repair']:
+        # Evaluate using execution success, syntax validity, and similarity
+        execution_successes = 0
+        syntax_valid_count = 0
+        similarity_scores = []
+        
+        for result in results:
+            expected = result['expected_output']
+            generated = result['model_output']
+            skip_exec = False
+            
+            # Extract just the code part for combined_repair
+            if task_name == 'combined_repair' and 'Fixed code:' in generated:
+                code_part = generated.split('Fixed code:', 1)[1].strip()
+            elif task_name == 'combined_repair' and 'No, the code is not buggy.' in generated:
+                skip_exec = True
+                similarity = calculate_rouge_l(generated, expected)
+            else:
+                code_part = generated
+            
+            if skip_exec:
+                execution_success = True
+                syntax_valid = True                
+            else:
+                execution_success, syntax_valid, similarity = evaluate_code_repair(
+                    code_part, expected
+                )
+            
+            if execution_success:
+                execution_successes += 1
+            if syntax_valid:
+                syntax_valid_count += 1
+            if syntax_valid and execution_success:
+                successful_samples += 1
+            
+            similarity_scores.append(similarity)
+            total_score += similarity
+        
+        metrics['additional_metrics'] = {
+            'execution_success_rate': round(execution_successes / len(results), 3),
+            'syntax_validity_rate': round(syntax_valid_count / len(results), 3),
+            'avg_similarity': round(np.mean(similarity_scores), 3),
+            'pass_at_1': round(execution_successes / len(results), 3)
+        }
+        
+    elif task_name == 'code_generation':
+        # Evaluate using execution success, syntax validity, and functionality
+        execution_successes = 0
+        syntax_valid_count = 0
+        functionality_scores = []
+        
+        for result in results:
+            expected = result['expected_output']
+            generated = result['model_output']
+            
+            execution_success, syntax_valid, functionality = evaluate_code_generation(
+                generated, expected
+            )
+            
+            if execution_success:
+                execution_successes += 1
+            if syntax_valid:
+                syntax_valid_count += 1
+            if syntax_valid and execution_success:
+                successful_samples += 1
+            
+            functionality_scores.append(functionality)
+            total_score += functionality
+        
+        metrics['additional_metrics'] = {
+            'execution_success_rate': round(execution_successes / len(results), 3),
+            'syntax_validity_rate': round(syntax_valid_count / len(results), 3),
+            'avg_functionality': round(np.mean(functionality_scores), 3),
+            'pass_at_1': round(execution_successes / len(results), 3)
+        }
+    
+    # Calculate overall metrics
+    metrics['success_rate'] = round(successful_samples / len(results), 3)
+    metrics['avg_score'] = round(total_score / len(results), 3)
+    
+    return metrics
+
+@timing
+def test_multitask_model(model, tokenizer, device, test_samples=None):
+    """Test the trained model on all test samples"""
+    
+    if test_samples is None:
+        # Load test samples from file if not provided
+        if os.path.exists(TEST_DATA_PATH):
+            test_samples = load_test_data(TEST_DATA_PATH)
+        else:
+            print(f"Error: Test data file {TEST_DATA_PATH} not found")
+            return
+    
+    print("\n" + "="*60)
+    print("TESTING MULTI-TASK MODEL")
+    print("="*60)
+    print(f"Testing with {len(test_samples)} samples")
+    
+    # Count samples by task
+    task_counts = {}
+    for sample in test_samples:
+        task = sample['task']
+        task_counts[task] = task_counts.get(task, 0) + 1
+    
+    print("Test samples by task:")
+    for task, count in task_counts.items():
+        print(f"  {task}: {count} samples")
+    print("="*60)
+    
+    model.eval()
+    
+    # Prepare detailed results for file
+    detailed_results = {
+        'metadata': {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'model_dir': OUTPUT_DIR,
+            'total_samples': len(test_samples),
+            'task_distribution': task_counts
+        },
+        'results_by_task': {},
+        'evaluation_metrics': {}
+    }
+    
+    # Test all samples and collect results
+    task_summaries = {}
+    
+    # Determine which tasks to evaluate
+    tasks_to_evaluate = EVAL_TASKS if EVAL_TASKS else list(TASK_PREFIXES.keys())
+    
+    # Validate task names
+    invalid_tasks = [task for task in tasks_to_evaluate if task not in TASK_PREFIXES]
+    if invalid_tasks:
+        print(f"ERROR: Invalid task names in EVAL_TASKS: {invalid_tasks}")
+        print(f"Available tasks: {list(TASK_PREFIXES.keys())}")
+        return
+    
+    print(f"Evaluating tasks: {tasks_to_evaluate}")
+    if EVAL_TASKS:
+        print(f"Note: Only evaluating {len(EVAL_TASKS)} out of {len(TASK_PREFIXES)} available tasks")
+    
+    for task_name in tasks_to_evaluate:
+        task_samples = [s for s in test_samples if s['task'] == task_name]
+        if task_samples:
+            print(f"Testing {task_name}: {len(task_samples)} samples...", end="", flush=True)
+            
+            task_results = []
+            
+            for i, sample in enumerate(task_samples):
+                response = generate_response(sample['input'], tokenizer, model, device, sample['task'])
+                
+                result = {
+                    'sample_id': i + 1,
+                    'input': sample['input'],
+                    'expected_output': sample.get('expected_output', ''),
+                    'model_output': response,
+                    'input_length': len(sample['input']),
+                    'output_length': len(response)
+                }
+                
+                # Add correctness evaluation
+                is_correct, score = evaluate_single_result(task_name, result)
+                result['correct'] = bool(is_correct)
+                result['score'] = round(score, 3)
+                
+                task_results.append(result)
+                
+                # Progress indicator
+                if (i + 1) % 10 == 0:
+                    print(f" {i + 1}", end="", flush=True)
+            
+            print(" ✓")
+            
+            # Store detailed results
+            detailed_results['results_by_task'][task_name] = task_results
+            
+            # Evaluate task performance using appropriate metrics
+            print(f"  Evaluating {task_name}...", end="", flush=True)
+            task_metrics = evaluate_task_results(task_name, task_results)
+            print(" ✓")
+            
+            # Store evaluation metrics
+            task_summaries[task_name] = task_metrics
+            detailed_results['evaluation_metrics'][task_name] = task_metrics
+    
+    # Calculate overall success rate across all tasks
+    overall_success_rate = 0.0
+    total_samples_evaluated = 0
+    weighted_success = 0.0
+    
+    for task_name, metrics in task_summaries.items():
+        task_samples = metrics['total_samples']
+        task_success = metrics['success_rate']
+        
+        weighted_success += task_success * task_samples
+        total_samples_evaluated += task_samples
+    
+    if total_samples_evaluated > 0:
+        overall_success_rate = weighted_success / total_samples_evaluated
+    
+    # Add overall metrics to results
+    detailed_results['evaluation_metrics']['overall'] = {
+        'overall_success_rate': round(overall_success_rate, 3),
+        'total_samples_evaluated': total_samples_evaluated,
+        'tasks_evaluated': len(task_summaries)
+    }
+    
+    # Save detailed results to file
+    results_file = os.path.join(TEST_OUTPUT_DIR, 'inst_tuning_results_detailed.json')
+    results_summary_file = os.path.join(TEST_OUTPUT_DIR, 'inst_tuning_results_summary.txt')
+    os.makedirs(TEST_OUTPUT_DIR, exist_ok=True)
+
+    with open(results_file, 'w', encoding='utf-8') as f:
+        json.dump(detailed_results, f, indent=2, ensure_ascii=False)
+    
+    # Create human-readable summary file
+    with open(results_summary_file, 'w', encoding='utf-8') as f:
+        f.write("="*80 + "\n")
+        f.write("MULTI-TASK MODEL TEST RESULTS SUMMARY\n")
+        f.write("="*80 + "\n")
+        f.write(f"Test Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Model Directory: {OUTPUT_DIR}\n")
+        f.write(f"Total samples tested: {len(test_samples)}\n")
+        f.write(f"Tasks tested: {len(task_counts)}\n")
+        f.write(f"Overall Success Rate: {overall_success_rate:.1%}\n\n")
+        
+        f.write("Task Distribution:\n")
+        for task, count in task_counts.items():
+            f.write(f"  {task}: {count} samples\n")
+        f.write("\n")
+        
+        f.write("EVALUATION METRICS BY TASK:\n")
+        f.write("="*80 + "\n")
+        for task_name, metrics in task_summaries.items():
+            f.write(f"\n{task_name.upper()}:\n")
+            f.write(f"  Samples tested: {metrics['total_samples']}\n")
+            f.write(f"  Success rate: {metrics['success_rate']:.1%}\n")
+            f.write(f"  Average score: {metrics['avg_score']:.3f}\n")
+            
+            # Task-specific metrics
+            additional = metrics.get('additional_metrics', {})
+            if task_name == 'code_summary':
+                f.write(f"  Average BLEU-4 score: {additional.get('avg_bleu_score', 0):.3f}\n")
+                f.write(f"  Max BLEU-4: {additional.get('max_bleu_score', 0):.3f}\n")
+                f.write(f"  BLEU > 0.15 (good): {additional.get('bleu_above_015', 0)}/{metrics['total_samples']}\n")
+                f.write(f"  BLEU > 0.25 (high quality): {additional.get('bleu_above_025', 0)}/{metrics['total_samples']}\n")
+                f.write(f"  Average ROUGE-L: {additional.get('avg_rouge_l', 0):.3f}\n")
+            elif task_name == 'bug_detection':
+                f.write(f"  Accuracy: {additional.get('accuracy', 0):.1%}\n")
+                f.write(f"  Correct predictions: {additional.get('correct_predictions', 0)}\n")
+            elif task_name in ['code_repair', 'code_generation', 'combined_repair']:
+                f.write(f"  Pass@1 (execution): {additional.get('pass_at_1', 0):.1%}\n")
+                f.write(f"  Syntax validity: {additional.get('syntax_validity_rate', 0):.1%}\n")
+                f.write(f"  Execution success: {additional.get('execution_success_rate', 0):.1%}\n")
+                if 'avg_similarity' in additional:
+                    f.write(f"  Average similarity: {additional['avg_similarity']:.3f}\n")
+                if 'avg_functionality' in additional:
+                    f.write(f"  Average functionality: {additional['avg_functionality']:.3f}\n")
+        
+        f.write("\n" + "="*80 + "\n")
+        f.write("SAMPLE OUTPUTS (First 3 per task)\n")
+        f.write("="*80 + "\n")
+        
+        for task_name in tasks_to_evaluate:
+            if task_name in detailed_results['results_by_task']:
+                task_results = detailed_results['results_by_task'][task_name]
+                f.write(f"\n{task_name.upper()}:\n")
+                f.write("-" * 40 + "\n")
+                
+                for i, result in enumerate(task_results[:3]):  # Show first 3 samples
+                    f.write(f"\nSample {i+1}:\n")
+                    f.write(f"Input: {result['input'][:200]}...\n")
+                    f.write(f"Expected: {result['expected_output'][:200]}...\n")
+                    f.write(f"Output: {result['model_output'][:200]}...\n")
+                    f.write("-" * 20 + "\n")
+    
+    # Show summary on screen
+    print(f"\n" + "="*60)
+    print("EVALUATION RESULTS SUMMARY")
+    print("="*60)
+    print(f"Overall Success Rate: {overall_success_rate:.1%}")
+    print(f"Total samples tested: {len(test_samples)}")
+    print(f"Tasks evaluated: {len(tasks_to_evaluate)}/{len(TASK_PREFIXES)} ({', '.join(tasks_to_evaluate)})")
+    if EVAL_TASKS:
+        excluded_tasks = [task for task in TASK_PREFIXES.keys() if task not in tasks_to_evaluate]
+        if excluded_tasks:
+            print(f"Tasks excluded: {', '.join(excluded_tasks)}")
+    print()
+    print("Per-task performance:")
+    for task_name, metrics in task_summaries.items():
+        additional = metrics.get('additional_metrics', {})
+        print(f"  {task_name}:")
+        print(f"    Success rate: {metrics['success_rate']:.1%}")
+        print(f"    Samples: {metrics['total_samples']}")
+        
+        # Show key metric for each task
+        if task_name == 'code_summary':
+            print(f"    BLEU-4: {additional.get('avg_bleu_score', 0):.3f}")
+        elif task_name == 'bug_detection':
+            print(f"    Accuracy: {additional.get('accuracy', 0):.1%}")
+        elif task_name in ['code_repair', 'code_generation', 'combined_repair']:
+            print(f"    Pass@1: {additional.get('pass_at_1', 0):.1%}")
+    
+    print(f"\nDetailed results saved to:")
+    print(f"  JSON: {results_file}")
+    print(f"  Text: {results_summary_file}")
+    print("="*60)
+
+def save_training_config(output_dir, config):
+    """Save training configuration for future reference"""
+    config_path = os.path.join(output_dir, 'training_config.json')
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2)
+    print(f"Training configuration saved to: {config_path}")
+
+def main():
+    """
+    Main function - runs the multi-task instruction tuning.
+    Edit the configuration constants at the top of the file to customize training.
+    """
+    print("="*60)
+    print("MULTI-TASK INSTRUCTION TUNING FOR CODET5+")
+    print("="*60)
+    print(f"Data root: {DATA_ROOT}  (uses codesearch/clone/repair/test_gen/**.jsonl)")
+    print(f"Output directory: {OUTPUT_DIR}")
+    print(f"Model name: {MODEL_NAME}")
+    print(f"Number of epochs: {NUM_EPOCHS}")
+    print(f"Batch size: {TRAIN_BATCH_SIZE}")
+    print(f"Learning rate: {LEARNING_RATE}")
+    print(f"Validation size: {VALIDATION_SIZE}")
+    print(f"Random seed: {RANDOM_SEED}")
+    print(f"Test only mode: {TEST_ONLY}")
+    print("="*60)
+    
+    # Set random seeds for reproducibility
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(RANDOM_SEED)
+    
+    # Determine device to use
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("Using CUDA GPU for training")
+        # OPTIMIZATION: Enable TF32 for faster matmul on Ampere+ GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # OPTIMIZATION: Enable cudnn benchmarking for optimal convolution algorithms
+        torch.backends.cudnn.benchmark = True
+        print("✓ GPU optimizations enabled (TF32, cuDNN benchmark)")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using Apple Silicon MPS for training")
+    else:
+        device = torch.device("cpu")
+        print("Using CPU for training")
+    
+    # Load model and tokenizer
+    model, tokenizer = setup_model_and_tokenizer(MODEL_NAME)
+    
+    # OPTIMIZATION: Move model to device with non_blocking for async transfer
+    if torch.cuda.is_available():
+        model = model.to(device, non_blocking=True)
+        print("✓ Model moved to GPU with non-blocking transfer")
+    else:
+        model = model.to(device)
+    
+    if TEST_ONLY:
+        # Only test existing model
+        print("Test-only mode: Loading existing model")
+        if os.path.exists(OUTPUT_DIR):
+            model = T5ForConditionalGeneration.from_pretrained(OUTPUT_DIR)
+            tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR)
+            if torch.cuda.is_available():
+                model = model.to(device, non_blocking=True)
+            else:
+                model = model.to(device)
+            test_multitask_model(model, tokenizer, device)
+        else:
+            print(f"Error: Model directory {OUTPUT_DIR} not found")
+        return
+    
+    
+    
+    # Load and prepare training data
+    train_dataset, eval_dataset = prepare_datasets(tokenizer, VALIDATION_SIZE, RANDOM_SEED)
+    
+    # Create output directory
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Train the model
+    trainer, train_result = train_model(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        device=device,
+        output_dir=OUTPUT_DIR,
+        num_epochs=NUM_EPOCHS,
+        batch_size=TRAIN_BATCH_SIZE,
+        learning_rate=LEARNING_RATE
+    )
+    
+    # Save training configuration for reference
+    config = {
+        'model_name': MODEL_NAME,
+        'data_path': DATA_ROOT,
+        'num_epochs': NUM_EPOCHS,
+        'batch_size': TRAIN_BATCH_SIZE,
+        'learning_rate': LEARNING_RATE,
+        'validation_size': VALIDATION_SIZE,
+        'seed': RANDOM_SEED,
+        'final_training_loss': train_result.training_loss,
+        'task_prefixes': TASK_PREFIXES,
+        'total_training_samples': len(train_dataset),
+        'total_validation_samples': len(eval_dataset)
+    }
+    save_training_config(OUTPUT_DIR, config)
+    
+    # Test the trained model
+    # print("\nTesting the trained multi-task model...")
+    # test_multitask_model(model, tokenizer, device)
+    
+    print("\n" + "="*60)
+    print("TRAINING COMPLETED SUCCESSFULLY!")
+    print("="*60)
+    print(f"Model saved to: {OUTPUT_DIR}")
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(eval_dataset)}")
+    print(f"Final training loss: {train_result.training_loss:.4f}")
+    print("="*60)
+    
+    # Print performance profiling results
+    print_timing_stats()
+
+if __name__ == "__main__":
+    main()
