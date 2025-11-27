@@ -10,17 +10,20 @@ Per-task performance:
     Samples: 200    
     Accuracy: 0.000    
     MRR: 0.000    
+    
   clone_detection:    
     Samples: 277    
     Precision: 0.000    
     Recall: 0.000    
     F1: 0.000    
+    
   code_repair:   
     Samples: 200    
     Pass@1: 0.240    
     Pass@5: 0.750   
     Pass@10: 0.940    
     Plausible patches: 48   
+    
   test_generation:    
     Samples: 554    
     Pass@1: 0.491   
@@ -34,10 +37,12 @@ Detailed results saved to:
   
 ### TO DO:
 check please 
+
 code_search:
     Samples: 200
     Accuracy: 0.000
     MRR: 0.000
+    
   clone_detection:
     Samples: 277
     Precision: 0.000
