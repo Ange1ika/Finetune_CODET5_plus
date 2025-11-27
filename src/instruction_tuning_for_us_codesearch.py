@@ -27,6 +27,9 @@ import json
 import os
 import random
 import signal
+import re
+
+
 from datetime import datetime
 from collections import Counter
 from torch.utils.data import Dataset
@@ -44,10 +47,12 @@ from transformers import (
 
 # Execution Mode
 TEST_ONLY = False             # Set to True to only test existing model (no training)
+EVAL_BEFORE_TRAIN = True     # Set to True to run code_search eval BEFORE fine-tuning
 
 # Evaluation Settings
 # List of tasks to evaluate. Empty list = evaluate all tasks, or you can specify tasks like the following.
-EVAL_TASKS = ['code_summary', 'bug_detection', 'code_repair', 'code_generation', 'combined_repair']
+EVAL_TASKS = ['code_search', 'clone_detection', 'code_repair', 'test_generation']
+EVAL_SPLIT = "test"  # Which split to use for evaluation ("test" is default)
 
 # ========================================
 # INSTRUCTION PREFIXES FOR EACH TASK
@@ -92,7 +97,7 @@ MAX_TARGET_LENGTH = 512        # Maximum tokens for output text
 EARLY_STOPPING_PATIENCE = 3   # Stop training if no improvement for this many evaluations
 EVAL_STEPS = 300              # Evaluate model performance every N training steps
 SAVE_STEPS = 300              # Save model checkpoint every N steps
-VALIDATION_SIZE = 0         # Number of samples to use for validation
+VALIDATION_SIZE = 0         # Number of samples to use for validation, 0 means using all val data
 
 # Text Generation Settings (for inference/testing)
 GENERATION_MAX_LENGTH = 512
@@ -280,6 +285,47 @@ def build_raw_examples_for_split(data_root: str, split: str):
             )
 
     return examples
+
+
+def build_test_sets_for_all_tasks(data_root: str):
+    """
+    Build test sets for ALL tasks (code_search, clone_detection,
+    code_repair, test_generation) from their respective test.jsonl files.
+
+    Returns:
+        dict[str, list[dict]] like:
+        {
+            "code_search": [
+                {"input": ..., "expected_output": ...},
+                ...
+            ],
+            "code_repair": [...],
+            "clone_detection": [...],
+            "test_generation": [...],
+        }
+    """
+    raw_examples = build_raw_examples_for_split(data_root, "test")
+
+    test_sets = {}
+    for ex in raw_examples:
+        task = ex["task"]
+        sample = {
+            "input": ex["input"],
+            "expected_output": ex["output"],
+        }
+        if task not in test_sets:
+            test_sets[task] = []
+        test_sets[task].append(sample)
+
+    # Simple log for sanity check
+    total = sum(len(v) for v in test_sets.values())
+    print(f"[Test] Built {total} test samples across tasks:")
+    for task, samples in test_sets.items():
+        print(f"  - {task}: {len(samples)} samples")
+
+    return test_sets
+
+
 
 def load_test_data(path):
     """Load test data from JSON file"""
@@ -674,6 +720,72 @@ def evaluate_code_repair(fixed_code, expected_code=None):
     
     return execution_success, syntax_valid, similarity_score
 
+
+def evaluate_code_repair_task(model, tokenizer, device,  repair_samples):
+    """
+    Evaluate Code Repair on the given test_samples using the existing
+    evaluate_code_repair(fixed_code, expected_code) function.
+    
+    repair_samples: list of {"input", "expected_output"} ONLY for code_repair.
+    
+    Computes Pass@1 as the fraction of samples where execution_success == True.
+    """
+   
+
+    if not repair_samples:
+        print("[Code Repair] No code_repair samples found in test_samples")
+        return {
+            "total_samples": 0,
+            "pass_at_1": 0.0,
+        }
+
+    print(f"\n[Code Repair] Evaluating on test_samples")
+    print(f"  #samples: {len(repair_samples)}")
+
+    model.eval()
+
+    total = len(repair_samples)
+    exec_successes = 0
+
+    for i, sample in enumerate(repair_samples, start=1):
+        prompt = sample["input"]                # already includes the prefix "fix a bug: ..."
+        expected_fixed = sample["expected_output"]  # ground-truth fixed code
+
+        # Generate fixed code from the model
+        generated = generate_response(
+            prompt,
+            tokenizer,
+            model,
+            device,
+            task_type="code_repair",
+        )
+
+        # Use the professor's evaluation function as-is
+        execution_success, syntax_valid, similarity = evaluate_code_repair(
+            generated,
+            expected_fixed,
+        )
+
+        if execution_success:
+            exec_successes += 1
+
+        if i % 20 == 0:
+            print(f"  processed {i}/{total} samples...")
+
+    pass_at_1 = exec_successes / total if total > 0 else 0.0
+
+    print(f"\n[Code Repair] Evaluation finished on test_samples")
+    print(f"  Total samples  : {total}")
+    print(f"  Exec success   : {exec_successes}")
+    print(f"  Pass@1         : {pass_at_1:.4f}")
+
+    return {
+        "total_samples": total,
+        "pass_at_1": pass_at_1,
+    }
+
+
+
 def evaluate_bug_detection(prediction, expected):
     """Evaluate bug detection accuracy"""
     # Normalize predictions
@@ -720,6 +832,89 @@ def evaluate_code_generation(generated_code, expected_output=None, description=N
             functionality_score = len(common_keywords) / len(desc_keywords)
     
     return execution_success, syntax_valid, functionality_score
+
+
+def parse_index_from_text(text, valid_indices=None):
+    """
+    Parse an integer index (e.g., 0/1/2) from a free-form model output string.
+    Returns the parsed index if valid, otherwise None.
+    """
+    if valid_indices is None:
+        valid_indices = {0, 1, 2}
+
+    # Try to find a standalone integer token
+    m = re.search(r"\b([0-9]+)\b", text)
+    if m:
+        idx = int(m.group(1))
+        if idx in valid_indices:
+            return idx
+
+    # Fallback: check if any valid index appears in the text
+    for i in sorted(valid_indices):
+        if str(i) in text:
+            return i
+
+    return None
+
+
+def evaluate_code_search(model, tokenizer, device, code_search_samples):
+    """
+    Evaluate Code Search on given test_samples.
+
+    code_search_samples: list of {"input", "expected_output"} ONLY for code_search.
+    Returns:
+        accuracy (float)
+    """
+    
+    if not code_search_samples:
+        print("[Code Search] No code_search samples found in test_samples")
+        return 0.0
+    
+    print(f"\n[Code Search] Evaluating on test_samples")
+    print(f"  #samples: {len(code_search_samples)}")
+
+    model.eval()
+
+    num_correct = 0
+    num_valid = 0
+
+    for i, sample in enumerate(code_search_samples, start=1):
+        input_text = sample["input"]
+        gold_str = sample["expected_output"]
+        try:
+            gold_idx = int(gold_str)
+        except ValueError:
+            # If gold label is somehow not an int, skip this sample safely
+            print(f"[WARN] Invalid gold index '{gold_str}' at sample {i}, skipping.")
+            continue
+
+        # Generate model prediction
+        pred_text = generate_response(input_text, tokenizer, model, device, task_type="code_search")
+
+        # Parse integer index from model output (0, 1, or 2)
+        pred_idx = parse_index_from_text(pred_text, valid_indices={0, 1, 2})
+        if pred_idx is None:
+            continue
+        
+        num_valid += 1
+        if pred_idx == gold_idx:
+            num_correct += 1
+
+        # Optional light progress logging
+        if i % 50 == 0:
+            print(f"  processed {i}/{len(code_search_samples)} samples...")
+
+    accuracy = (num_correct / num_valid) if num_valid > 0 else 0.0
+
+    print(f"\n[Code Search] Evaluation finished on test_samples")
+    print(f"  Total samples          : {len(code_search_samples)}")
+    print(f"  Valid predictions      : {num_valid}")
+    print(f"  Correct predictions    : {num_correct}")
+    print(f"  Accuracy (Top-1 index) : {accuracy:.4f}")
+
+    return accuracy
+
+
 
 def evaluate_single_result(task_name, result):
     """Evaluate a single result and return correctness status and score"""
@@ -1168,6 +1363,7 @@ def main():
     print(f"Validation size: {VALIDATION_SIZE}")
     print(f"Random seed: {RANDOM_SEED}")
     print(f"Test only mode: {TEST_ONLY}")
+    print(f"Eval before train: {EVAL_BEFORE_TRAIN}")
     print("="*60)
     
     # Set random seeds for reproducibility
@@ -1192,6 +1388,15 @@ def main():
     model, tokenizer = setup_model_and_tokenizer(MODEL_NAME)
     model.to(device)
     
+    # Load test data
+    # Build task-specific test sets
+    test_sets = build_test_sets_for_all_tasks(DATA_ROOT)
+    code_search_test = test_sets.get("code_search", [])
+    code_repair_test = test_sets.get("code_repair", [])
+    
+    # ======================================================================
+    # TEST-ONLY MODE (no training)
+    # ======================================================================
     if TEST_ONLY:
         # Only test existing model
         print("Test-only mode: Loading existing model")
@@ -1199,16 +1404,50 @@ def main():
             model = T5ForConditionalGeneration.from_pretrained(OUTPUT_DIR)
             tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR)
             model.to(device)
-            test_multitask_model(model, tokenizer, device)
+            
+            
+            # eval part for each tasks
+            
+            # Code Search evaluation
+            cs_acc = evaluate_code_search(model, tokenizer, device, code_search_test)
+            print(f"[Code Search] TEST-ONLY accuracy: {cs_acc:.4f}")
+            
+            # Code Repair evaluation (Pass@1)
+            repair_metrics = evaluate_code_repair_task(model, tokenizer, device, code_repair_test)
+            print(f"[Code Repair] TEST-ONLY Pass@1: {repair_metrics['pass_at_1']:.4f}")
+            
+            
+            
         else:
             print(f"Error: Model directory {OUTPUT_DIR} not found")
         return
     
     
-    
+    # ======================================================================
+    # TRAINING MODE
+    # ======================================================================
+
     # Load and prepare training data
     train_dataset, eval_dataset = prepare_datasets(tokenizer, VALIDATION_SIZE, RANDOM_SEED)
     
+    
+    # (Optional)Evaluate code_search BEFORE fine-tuning on the chosen evaluation split
+    if EVAL_BEFORE_TRAIN:
+        print("\n" + "="*60)
+        print(f"[Code Search] Evaluation on split='{EVAL_SPLIT}' BEFORE fine-tuning")
+        print("="*60)
+        acc_before = evaluate_code_search(model, tokenizer, device, code_search_test)
+        print(f"[Code Search] BEFORE fine-tuning accuracy: {acc_before:.4f}")
+        
+        print("\n" + "="*60)
+        print("[Code Repair] Evaluation BEFORE fine-tuning")
+        print("="*60)
+        repair_before = evaluate_code_repair_task(model, tokenizer, device, code_repair_test)
+        print(f"[Code Repair] BEFORE fine-tuning Pass@1: {repair_before['pass_at_1']:.4f}")
+
+
+
+
     # Create output directory
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
@@ -1253,6 +1492,19 @@ def main():
     print(f"Validation samples: {len(eval_dataset)}")
     print(f"Final training loss: {train_result.training_loss:.4f}")
     print("="*60)
+    
+    # Evaluate code_search AFTER fine-tuning on the same split
+    print("\n" + "="*60)
+    print(f"[Code Search] Evaluation on split='{EVAL_SPLIT}' AFTER fine-tuning")
+    print("="*60)
+    acc_after = evaluate_code_search(model, tokenizer, device,  code_search_test)
+    print(f"[Code Search] AFTER fine-tuning accuracy: {acc_after:.4f}")
+    
+    print("\n" + "="*60)
+    print("[Code Repair] Evaluation AFTER fine-tuning")
+    print("="*60)
+    repair_after = evaluate_code_repair_task(model, tokenizer, device, code_repair_test)
+    print(f"[Code Repair] AFTER fine-tuning Pass@1: {repair_after['pass_at_1']:.4f}")
 
 if __name__ == "__main__":
     main()
