@@ -1,3 +1,5 @@
 .venv/
 fine_tuned_multitask_model/
 __pycache__/
+wandb/
+.DS_Store/
