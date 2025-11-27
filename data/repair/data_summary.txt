@@ -1,0 +1,37 @@
+Total records of: all.jsonl
+Total: 2656
+opencv: 1088 records
+pytorch: 82 records
+pydantic: 9 records
+scikit-learn: 1475 records
+fast_api: 2 records
+----------------------------------------
+Total records of: cut_off_all.jsonl
+Total: 2000
+scikit-learn: 1073 records
+opencv: 855 records
+pytorch: 64 records
+fast_api: 2 records
+pydantic: 6 records
+----------------------------------------
+Total records of: train.jsonl
+Total: 1600
+scikit-learn: 871 records
+opencv: 669 records
+pytorch: 53 records
+fast_api: 2 records
+pydantic: 5 records
+----------------------------------------
+Total records of: validation.jsonl
+Total: 200
+opencv: 89 records
+scikit-learn: 109 records
+pytorch: 2 records
+----------------------------------------
+Total records of: test.jsonl
+Total: 200
+scikit-learn: 93 records
+opencv: 97 records
+pytorch: 9 records
+pydantic: 1 records
+----------------------------------------
