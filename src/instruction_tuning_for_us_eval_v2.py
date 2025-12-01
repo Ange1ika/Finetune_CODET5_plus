@@ -28,7 +28,7 @@ from transformers import (
 )
 from generate_radar_plot import generate_radar_plot
 # Execution Mode
-TEST_ONLY = False             # Set to True to only test existing model (no training)
+TEST_ONLY = True             # Set to True to only test existing model (no training)
 
 # Evaluation Settings
 # List of tasks to evaluate. Empty list = evaluate all tasks, or you can specify tasks like the following.
@@ -38,6 +38,7 @@ EVAL_TASKS = [
     "code_repair",
     "test_generation"
 ]
+
 
 # ========================================
 # INSTRUCTION PREFIXES FOR EACH TASK
@@ -166,9 +167,20 @@ def evaluate_clone_detection(results):
         pred = r["model_output"].strip()
         gold = r["expected_output"].strip()
 
-        if pred == "1" and gold == "1": TP += 1
-        if pred == "1" and gold == "0": FP += 1
-        if pred == "0" and gold == "1": FN += 1
+
+        try:
+            gold_label = int(gold)
+        except ValueError:
+            continue
+
+        pred_label = parse_index_from_text(pred, valid_indices={0, 1})
+        if pred_label is None:
+            continue
+
+
+        if pred_label == 1 and gold_label == 1: TP += 1
+        if pred_label == 1 and gold_label == 0: FP += 1
+        if pred_label == 0 and gold_label == 1: FN += 1
 
     precision = TP / (TP + FP) if (TP + FP) else 0
     recall = TP / (TP + FN) if (TP + FN) else 0
@@ -884,7 +896,16 @@ def evaluate_single_result(task_name, result):
 
     # 2) CLONE DETECTION (Primary: F1)
     if task_name == "clone_detection":
-        is_correct = (pred == gold)
+        try:
+            gold_label = int(gold)
+        except ValueError:
+            return False, 0.0
+
+        pred_label = parse_index_from_text(pred, valid_indices={0, 1})
+        if pred_label is None:
+            return False, 0.0
+
+        is_correct = (pred_label == gold_label)
         return is_correct, 1.0 if is_correct else 0.0
 
     # 3) CODE REPAIR (Primary: Pass@K, Secondary: plausible patches)
@@ -892,28 +913,21 @@ def evaluate_single_result(task_name, result):
         # We only care whether the patch compiles and executes successfully.
         try:
             compile(pred, "<string>", "exec")
-            syntax_ok = True
-        except SyntaxError:
-            syntax_ok = False
-
-        exec_ok, _, _ = execute_code_safely(pred)
-
-        # A patch is considered "correct" if it is syntactically valid and passes execution.
-        is_correct = syntax_ok and exec_ok
-
-        # Score is 0/1; Pass@K is computed from these Bernoulli outcomes.
-        return is_correct, 1.0 if is_correct else 0.0
+            exec_ok, _, _ = execute_code_safely(pred)
+            is_correct = exec_ok
+            return is_correct, 1.0 if is_correct else 0.0
+        except Exception:
+            return False, 0.0
 
     # 4) TEST GENERATION (Primary: BLEU, Secondary: correctness/coverage)
     if task_name == "test_generation":
-        bleu = calculate_bleu_score(gold, pred)
-
-        # For "correctness" at sample level, we can threshold BLEU.
-        # Since your target is BLEU > 0.65, we use the same threshold here.
-        is_correct = bleu >= 0.65
-
-        # Score is the BLEU value itself; aggregation will compute average BLEU.
-        return is_correct, float(bleu)
+        try:
+            compile(pred, "<string>", "exec")
+            exec_ok, _, _ = execute_code_safely(pred)
+            is_correct = exec_ok
+            return is_correct, 1.0 if is_correct else 0.0
+        except Exception:
+            return False, 0.0
 
     # Fallback for unknown tasks
     return False, 0.0

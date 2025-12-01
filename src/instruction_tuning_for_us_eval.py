@@ -116,6 +116,17 @@ def evaluate_clone_detection(results):
         pred = r["model_output"].strip()
         gold = r["expected_output"].strip()
 
+       
+        try:
+            gold_label = int(gold_text)
+        except ValueError:
+            continue
+
+        pred_label = parse_index_from_text(pred_text, valid_indices={0, 1})
+        if pred_label is None:
+            continue
+
+
         if pred == "1" and gold == "1": TP += 1
         if pred == "1" and gold == "0": FP += 1
         if pred == "0" and gold == "1": FN += 1
@@ -761,8 +772,32 @@ def evaluate_single_result(task_name, result):
     pred = result["model_output"].strip()
     gold = result["expected_output"].strip()
 
-    if task_name in ["code_search", "clone_detection"]:
-        return pred == gold, 1.0 if pred == gold else 0.0
+
+    if task_name == "code_search":
+        try:
+            gold_idx = int(gold)
+        except ValueError:
+            return False, 0.0
+
+        pred_idx = parse_index_from_text(pred, valid_indices={0, 1, 2})
+        if pred_idx is None:
+            return False, 0.0
+
+        is_correct = (pred_idx == gold_idx)
+        return is_correct, 1.0 if is_correct else 0.0
+    
+    if task_name == "clone_detection":
+        try:
+            gold_label = int(gold)
+        except ValueError:
+            return False, 0.0
+
+        pred_label = parse_index_from_text(pred, valid_indices={0, 1})
+        if pred_label is None:
+            return False, 0.0
+
+        is_correct = (pred_label == gold_label)
+        return is_correct, 1.0 if is_correct else 0.0
 
     if task_name in ["code_repair", "test_generation"]:
         try:
