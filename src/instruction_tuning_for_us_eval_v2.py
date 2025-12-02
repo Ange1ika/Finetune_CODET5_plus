@@ -612,6 +612,9 @@ def setup_model_and_tokenizer(model_name="Salesforce/codet5p-220m"):
         model.resize_token_embeddings(len(tokenizer))
         print(f"Added {num_added} special tokens to vocabulary")
     
+    # FOR OPT
+    model.config.use_cache = False
+    
     return model, tokenizer
 
 def train_model(
@@ -629,6 +632,11 @@ def train_model(
     early_stopping_patience=EARLY_STOPPING_PATIENCE
 ):
     """Train the multi-task model using Hugging Face Trainer"""
+
+    # Updated args FOR OPT
+    cuda_available = torch.cuda.is_available()
+    num_workers = 2 if cuda_available else 0
+    print(f"Data loading optimization: num_workers={num_workers}, pin_memory={cuda_available}")
     
     # Configure training parameters
     training_args = TrainingArguments(
@@ -649,11 +657,21 @@ def train_model(
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         save_total_limit=3,
-        dataloader_pin_memory=False,
+        dataloader_pin_memory=cuda_available,
+        dataloader_num_workers=num_workers,
+        dataloader_prefetch_factor=2 if cuda_available else 0,
+        ddp_find_unused_parameters=False if cuda_available else None,
         remove_unused_columns=False,
         prediction_loss_only=True,
-        fp16=torch.cuda.is_available(),
+        fp16=cuda_available,
+        fp16_full_eval=cuda_available,
         gradient_accumulation_steps=4,
+        gradient_checkpointing=True,
+        optim="adamw_torch_fused",
+        group_by_length=False,
+        max_grad_norm=1.0,
+        lr_scheduler_type="cosine",
+        auto_find_batch_size=False,
     )
 
     
@@ -704,9 +722,10 @@ def generate_response(text, tokenizer, model, device, task_type="general"):
         return_tensors="pt",
         max_length=MAX_INPUT_LENGTH
     )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    # FOR OPT
+    inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
     
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model.generate(
             **inputs,
             max_length=GENERATION_MAX_LENGTH,
@@ -719,6 +738,7 @@ def generate_response(text, tokenizer, model, device, task_type="general"):
             do_sample=False,  # Use beam search for better quality
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
+            use_cache=True
         )
     
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -1210,6 +1230,11 @@ def main():
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print("Using CUDA GPU for training")
+        # FOR OPT
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        print("✓ GPU optimizations enabled (TF32, cuDNN benchmark)")
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
         print("Using Apple Silicon MPS for training")
@@ -1219,7 +1244,12 @@ def main():
     
     # Load model and tokenizer
     model, tokenizer = setup_model_and_tokenizer(MODEL_NAME)
-    model.to(device)
+    # FOR OPT
+    if torch.cuda.is_available():
+        model = model.to(device, non_blocking=True)
+        print("✓ Model moved to GPU with non-blocking transfer")
+    else:
+        model = model.to(device)
     
     if TEST_ONLY:
         # Only test existing model
@@ -1227,7 +1257,12 @@ def main():
         if os.path.exists(OUTPUT_DIR):
             model = T5ForConditionalGeneration.from_pretrained(OUTPUT_DIR)
             tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR)
-            model.to(device)
+            # FOR OPT
+            if torch.cuda.is_available():
+                model = model.to(device, non_blocking=True)
+                print("✓ Model moved to GPU with non-blocking transfer")
+            else:
+                model = model.to(device)
             test_multitask_model(model, tokenizer, device)
         else:
             print(f"Error: Model directory {OUTPUT_DIR} not found")
