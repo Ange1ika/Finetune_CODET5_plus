@@ -47,7 +47,7 @@ TEST_ONLY = False             # Set to True to only test existing model (no trai
 
 # Evaluation Settings
 # List of tasks to evaluate. Empty list = evaluate all tasks, or you can specify tasks like the following.
-EVAL_TASKS = ['code_summary', 'bug_detection', 'code_repair', 'code_generation', 'combined_repair']
+EVAL_TASKS = ['code_search', 'clone_detection', 'code_repair', 'test_generation']
 
 # ========================================
 # INSTRUCTION PREFIXES FOR EACH TASK

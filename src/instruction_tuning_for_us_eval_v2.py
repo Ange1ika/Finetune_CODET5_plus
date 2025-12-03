@@ -29,6 +29,13 @@ from transformers import (
 from generate_radar_plot import generate_radar_plot
 # Execution Mode
 TEST_ONLY = True             # Set to True to only test existing model (no training)
+# When TEST_ONLY is True, choose which model to evaluate:
+#   - "pretrained": load the base model from MODEL_NAME (no fine-tuning)
+#   - "finetuned": load the fine-tuned model from OUTPUT_DIR
+TEST_MODEL_SOURCE = "pretrained"   # or "finetuned"
+
+
+
 
 # Evaluation Settings
 # List of tasks to evaluate. Empty list = evaluate all tasks, or you can specify tasks like the following.
@@ -633,7 +640,7 @@ def train_model(
     # Configure training parameters
     training_args = TrainingArguments(
         output_dir=output_dir,
-        evaluation_strategy="steps",   # <- fixed
+        eval_strategy="steps",   # <- fixed
         eval_steps=eval_steps,
         save_steps=save_steps,
         save_strategy="steps",
@@ -1223,12 +1230,27 @@ def main():
     
     if TEST_ONLY:
         # Only test existing model
-        print("Test-only mode: Loading existing model")
-        if os.path.exists(OUTPUT_DIR):
+        print("Test-only mode: Loading existing model")        
+        if TEST_MODEL_SOURCE == "pretrained":
+            # Evaluate the base pretrained model (no fine-tuning)
+            print("Test-only mode: evaluating PRETRAINED model from MODEL_NAME")
+            model, tokenizer = setup_model_and_tokenizer(MODEL_NAME)
+            model.to(device)
+            test_multitask_model(model, tokenizer, device)
+            return
+        
+        
+        elif TEST_MODEL_SOURCE == "finetuned":
+            # Evaluate a previously fine-tuned model saved in OUTPUT_DIR
+            print("Test-only mode: evaluating FINETUNED model from OUTPUT_DIR")
+            if not os.path.exists(OUTPUT_DIR):
+                print(f"Error: model directory {OUTPUT_DIR} not found")
+                return
             model = T5ForConditionalGeneration.from_pretrained(OUTPUT_DIR)
             tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR)
             model.to(device)
             test_multitask_model(model, tokenizer, device)
+            return
         else:
             print(f"Error: Model directory {OUTPUT_DIR} not found")
         return
