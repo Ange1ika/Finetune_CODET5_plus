@@ -75,7 +75,7 @@ DATA_ROOT = os.path.join(BASE_DIR, "..", "data")
 
 OUTPUT_DIR = "./fine_tuned_multitask_model"    # Where to save the trained model
 TEST_OUTPUT_DIR = "./output"                   # Where to save test results
-MODEL_NAME = "Salesforce/codet5p-220m"         # Base model to fine-tune
+MODEL_NAME = "Salesforce/codet5p-770m"         # Base model to fine-tune
 RANDOM_SEED = 42                               # For reproducible results
 
 # Training Settings
