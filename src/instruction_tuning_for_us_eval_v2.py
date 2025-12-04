@@ -28,7 +28,7 @@ from transformers import (
 )
 from generate_radar_plot import generate_radar_plot
 # Execution Mode
-TEST_ONLY = True             # Set to True to only test existing model (no training)
+TEST_ONLY = False             # Set to True to only test existing model (no training)
 
 # Evaluation Settings
 # List of tasks to evaluate. Empty list = evaluate all tasks, or you can specify tasks like the following.
@@ -83,7 +83,7 @@ MAX_TARGET_LENGTH = 256        # Maximum tokens for output text
 EARLY_STOPPING_PATIENCE = 3   # Stop training if no improvement for this many evaluations
 EVAL_STEPS = 300              # Evaluate model performance every N training steps
 SAVE_STEPS = 300              # Save model checkpoint every N steps
-VALIDATION_SIZE = 0         # Number of samples to use for validation
+VALIDATION_SIZE = 500         # Number of samples to use for validation (was 0, needs >0 for eval)
 
 # Text Generation Settings (for inference/testing)
 GENERATION_MAX_LENGTH = 512
@@ -638,11 +638,14 @@ def train_model(
     num_workers = 2 if cuda_available else 0
     print(f"Data loading optimization: num_workers={num_workers}, pin_memory={cuda_available}")
     
+    # Check if we have validation data
+    has_eval = eval_dataset is not None and len(eval_dataset) > 0
+    
     # Configure training parameters
     training_args = TrainingArguments(
         output_dir=output_dir,
-        evaluation_strategy="steps",   # <- fixed
-        eval_steps=eval_steps,
+        eval_strategy="steps" if has_eval else "no",
+        eval_steps=eval_steps if has_eval else None,
         save_steps=save_steps,
         save_strategy="steps",
         learning_rate=learning_rate,
@@ -653,13 +656,13 @@ def train_model(
         warmup_steps=300,
         logging_dir=f"{output_dir}/logs",
         logging_steps=100,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
+        load_best_model_at_end=has_eval,  # Only if we have eval data
+        metric_for_best_model="eval_loss" if has_eval else None,
         greater_is_better=False,
         save_total_limit=3,
         dataloader_pin_memory=cuda_available,
         dataloader_num_workers=num_workers,
-        dataloader_prefetch_factor=2 if cuda_available else 0,
+        dataloader_prefetch_factor=2 if num_workers > 0 else None,
         ddp_find_unused_parameters=False if cuda_available else None,
         remove_unused_columns=False,
         prediction_loss_only=True,
