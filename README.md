@@ -12,9 +12,6 @@ The goal is to start from a **pretrained CodeT5+ model** and then jointly fine-t
 ## Model
 
 - **Base model (pre-finetuning):** `Salesforce/codet5p-770m`
-- **Fine-tuned model:** _TBD_
-
-All results below are from the **pretrained model only** (no task-specific fine-tuning).
 
 ## Data & Tasks
 
@@ -148,6 +145,10 @@ OUTPUT_DIR = "./fine_tuned_multitask_model"
 ```
 
 ## Baseline Results (Pre-Finetuning, CodeT5p-770M)
+
+
+All results below are from the **pretrained model only** (no task-specific fine-tuning).
+
 
 Baseline evaluation on **800 samples** (200 per task):
 
