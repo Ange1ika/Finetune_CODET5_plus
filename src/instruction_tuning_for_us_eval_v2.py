@@ -75,7 +75,7 @@ RANDOM_SEED = 42                               # For reproducible results
 TRAIN_BATCH_SIZE = 4          # Number of samples per training batch (reduce if out of memory)
 EVAL_BATCH_SIZE = 4            # Number of samples per validation batch
 LEARNING_RATE = 2e-5           # How fast the model learns (lower = more stable)
-NUM_EPOCHS = 1                # How many times to go through the entire dataset
+NUM_EPOCHS = 20                # How many times to go through the entire dataset
 MAX_INPUT_LENGTH = 512        # Maximum tokens for input text (code/descriptions)
 MAX_TARGET_LENGTH = 256        # Maximum tokens for output text
 
