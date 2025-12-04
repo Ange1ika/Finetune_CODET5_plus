@@ -68,9 +68,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_ROOT = os.path.join(BASE_DIR, "..", "data")
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-OUTPUT_DIR = os.path.join("fine_tuned_multitask_models", timestamp)    # Where to save the trained model
 TEST_ONLY_MODEL_SUBDIR = ""  # Pre-trained model subdir for testing only
-TEST_OUTPUT_DIR = os.path.join("outputs", timestamp)                   # Where to save test results
+OUTPUT_DIR = os.path.join("fine_tuned_multitask_model", timestamp)    # Where to save the trained model
+TEST_OUTPUT_DIR = os.path.join("output", timestamp)                   # Where to save test results
 MODEL_NAME = "Salesforce/codet5p-220m"         # Base model to fine-tune
 RANDOM_SEED = 42                               # For reproducible results
 TEST_PARTIAL = None                              # Number of samples to test on (None for all)
@@ -1295,7 +1295,7 @@ def main():
     
     if TEST_ONLY:
         # Only test existing model
-        test_only_output_dir = os.path.join("fine_tuned_multitask_models", TEST_ONLY_MODEL_SUBDIR)
+        test_only_output_dir = os.path.join("fine_tuned_multitask_model", TEST_ONLY_MODEL_SUBDIR)
         print("Test-only mode: Loading existing model")
         if os.path.exists(test_only_output_dir):
             model = T5ForConditionalGeneration.from_pretrained(test_only_output_dir)
@@ -1306,7 +1306,7 @@ def main():
                 print("✓ Model moved to GPU with non-blocking transfer")
             else:
                 model = model.to(device)
-            test_multitask_model(model, tokenizer, device, output_dir=test_only_output_dir, test_output_dir=os.path.join("outputs", f"{TEST_ONLY_MODEL_SUBDIR}{f'_partial_{TEST_PARTIAL}' if TEST_PARTIAL is not None else ''}"))
+            test_multitask_model(model, tokenizer, device, output_dir=test_only_output_dir, test_output_dir=os.path.join("output", f"{TEST_ONLY_MODEL_SUBDIR}{f'_partial_{TEST_PARTIAL}' if TEST_PARTIAL is not None else ''}"))
         else:
             print(f"Error: Model directory {test_only_output_dir} not found")
         return
