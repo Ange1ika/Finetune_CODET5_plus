@@ -30,6 +30,8 @@ from generate_radar_plot import generate_radar_plot
 # Execution Mode
 TEST_ONLY = False             # Set to True to only test existing model (no training)
 
+# os.environ["WANDB_MODE"] = "offline"
+
 # Evaluation Settings
 # List of tasks to evaluate. Empty list = evaluate all tasks, or you can specify tasks like the following.
 EVAL_TASKS = [
@@ -65,9 +67,9 @@ TASK_PREFIXES = {
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_ROOT = os.path.join(BASE_DIR, "..", "data")
 
-
-OUTPUT_DIR = "./fine_tuned_multitask_model"    # Where to save the trained model
-TEST_OUTPUT_DIR = "./output"                   # Where to save test results
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_DIR = f"./fine_tuned_multitask_model_{timestamp}"    # Where to save the trained model
+TEST_OUTPUT_DIR = f"./output_{timestamp}"                   # Where to save test results
 MODEL_NAME = "Salesforce/codet5p-220m"         # Base model to fine-tune
 RANDOM_SEED = 42                               # For reproducible results
 
@@ -1201,6 +1203,30 @@ def save_training_config(output_dir, config):
         json.dump(config, f, indent=2)
     print(f"Training configuration saved to: {config_path}")
 
+def save_parameter_settings(output_dir):
+    with open(os.path.join(output_dir, "training_parameters.json"), "w") as f:
+        params = {
+            "DATA_ROOT": DATA_ROOT,
+            "MODEL_NAME": MODEL_NAME,
+            "TRAIN_BATCH_SIZE": TRAIN_BATCH_SIZE,
+            "EVAL_BATCH_SIZE": EVAL_BATCH_SIZE,
+            "LEARNING_RATE": LEARNING_RATE,
+            "NUM_EPOCHS": NUM_EPOCHS,
+            "MAX_INPUT_LENGTH": MAX_INPUT_LENGTH,
+            "MAX_TARGET_LENGTH": MAX_TARGET_LENGTH,
+            "EARLY_STOPPING_PATIENCE": EARLY_STOPPING_PATIENCE,
+            "EVAL_STEPS": EVAL_STEPS,
+            "SAVE_STEPS": SAVE_STEPS,
+            "VALIDATION_SIZE": VALIDATION_SIZE,
+            "GENERATION_MAX_LENGTH": GENERATION_MAX_LENGTH,
+            "GENERATION_MIN_LENGTH": GENERATION_MIN_LENGTH,
+            "GENERATION_NUM_BEAMS": GENERATION_NUM_BEAMS,
+            "GENERATION_LENGTH_PENALTY": GENERATION_LENGTH_PENALTY,
+            "GENERATION_REPETITION_PENALTY": GENERATION_REPETITION_PENALTY,
+            "GENERATION_NO_REPEAT_NGRAM_SIZE": GENERATION_NO_REPEAT_NGRAM_SIZE
+        }
+        json.dump(params, f, indent=4)
+
 def main():
     torch.cuda.empty_cache()
 
@@ -1272,7 +1298,6 @@ def main():
         return
     
     
-    
     # Load and prepare training data
     train_dataset, eval_dataset = prepare_datasets(tokenizer, VALIDATION_SIZE, RANDOM_SEED)
     
@@ -1307,6 +1332,7 @@ def main():
         'total_validation_samples': len(eval_dataset)
     }
     save_training_config(OUTPUT_DIR, config)
+    save_parameter_settings(OUTPUT_DIR)
     
     # Test the trained model
     # print("\nTesting the trained multi-task model...")
