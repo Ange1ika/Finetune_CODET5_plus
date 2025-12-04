@@ -73,7 +73,7 @@ TEST_ONLY_MODEL_SUBDIR = ""  # Pre-trained model subdir for testing only
 TEST_OUTPUT_DIR = os.path.join("outputs", timestamp)                   # Where to save test results
 MODEL_NAME = "Salesforce/codet5p-220m"         # Base model to fine-tune
 RANDOM_SEED = 42                               # For reproducible results
-TEST_PARTIAL = 50                              # Number of samples to test on (None for all)
+TEST_PARTIAL = None                              # Number of samples to test on (None for all)
 
 # Training Settings
 TRAIN_BATCH_SIZE = 4          # Number of samples per training batch (reduce if out of memory)
@@ -961,7 +961,7 @@ def evaluate_single_result(task_name, result):
 
 
 
-def test_multitask_model(model, tokenizer, device, test_samples=None, test_output_dir=TEST_OUTPUT_DIR):
+def test_multitask_model(model, tokenizer, device, test_samples=None, output_dir=OUTPUT_DIR, test_output_dir=TEST_OUTPUT_DIR):
     """Test the trained model on all test samples"""
     if test_samples is None:
         test_samples = load_all_test_data_from_folders(DATA_ROOT)
@@ -971,8 +971,15 @@ def test_multitask_model(model, tokenizer, device, test_samples=None, test_outpu
         return
     
     if TEST_PARTIAL is not None:
-        test_samples = test_samples[:TEST_PARTIAL + 1]
-        print(f"NOTE: Testing on a partial set of {TEST_PARTIAL} samples")
+        print(f" * NOTE: Testing on a partial set of {TEST_PARTIAL} samples per task")
+        # get TEST_PARTIAL samples for each task
+        partial_samples = []
+        for task_name in TASK_PREFIXES.keys():
+            task_samples = [s for s in test_samples if s['task'] == task_name]
+            partial_samples.extend(task_samples[:TEST_PARTIAL])
+        test_samples = partial_samples
+        print(f"   Reduced to {len(test_samples)} total samples")
+
     
     print("\n" + "="*60)
     print("TESTING MULTI-TASK MODEL")
@@ -996,7 +1003,7 @@ def test_multitask_model(model, tokenizer, device, test_samples=None, test_outpu
     detailed_results = {
         'metadata': {
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'model_dir': OUTPUT_DIR,
+            'model_dir': output_dir,
             'total_samples': len(test_samples),
             'task_distribution': task_counts
         },
@@ -1162,7 +1169,7 @@ def test_multitask_model(model, tokenizer, device, test_samples=None, test_outpu
                     f.write("-" * 20 + "\n")
 
     generate_latex_table(task_summaries, output_path=os.path.join(test_output_dir, "results_table.tex"))
-    generate_radar_plot(task_summaries, output_path=os.path.join(test_output_dir, "results_radar_plot.png"))
+    generate_radar_plot(task_summaries, save_path=os.path.join(test_output_dir, "results_radar_plot.png"))
 
     # Show summary on screen
     print(f"\n" + "="*60)
@@ -1299,9 +1306,9 @@ def main():
                 print("✓ Model moved to GPU with non-blocking transfer")
             else:
                 model = model.to(device)
-            test_multitask_model(model, tokenizer, device, test_output_dir=os.path.join("outputs", f"{TEST_ONLY_MODEL_SUBDIR}{f'_partial_{TEST_PARTIAL}' if TEST_PARTIAL is not None else ''}"))
+            test_multitask_model(model, tokenizer, device, output_dir=test_only_output_dir, test_output_dir=os.path.join("outputs", f"{TEST_ONLY_MODEL_SUBDIR}{f'_partial_{TEST_PARTIAL}' if TEST_PARTIAL is not None else ''}"))
         else:
-            print(f"Error: Model directory {OUTPUT_DIR} not found")
+            print(f"Error: Model directory {test_only_output_dir} not found")
         return
     
     
