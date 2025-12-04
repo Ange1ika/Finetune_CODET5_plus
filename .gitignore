@@ -1,6 +1,7 @@
 .venv/
-fine_tuned_multitask_model*/
+fine_tuned_multitask_models/
 __pycache__/
 wandb/
 .DS_Store/
 logs/
+outputs/

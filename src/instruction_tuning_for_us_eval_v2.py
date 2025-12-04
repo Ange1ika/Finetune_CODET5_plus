@@ -68,10 +68,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_ROOT = os.path.join(BASE_DIR, "..", "data")
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-OUTPUT_DIR = f"./fine_tuned_multitask_model_{timestamp}"    # Where to save the trained model
-TEST_OUTPUT_DIR = f"./output_{timestamp}"                   # Where to save test results
+OUTPUT_DIR = os.path.join("fine_tuned_multitask_models", timestamp)    # Where to save the trained model
+TEST_ONLY_MODEL_SUBDIR = ""  # Pre-trained model subdir for testing only
+TEST_OUTPUT_DIR = os.path.join("outputs", timestamp)                   # Where to save test results
 MODEL_NAME = "Salesforce/codet5p-220m"         # Base model to fine-tune
 RANDOM_SEED = 42                               # For reproducible results
+TEST_PARTIAL = 50                              # Number of samples to test on (None for all)
 
 # Training Settings
 TRAIN_BATCH_SIZE = 4          # Number of samples per training batch (reduce if out of memory)
@@ -625,7 +627,7 @@ def train_model(
     train_dataset, 
     eval_dataset, 
     device, 
-    output_dir="./fine_tuned_multitask_model",
+    output_dir=OUTPUT_DIR,
     num_epochs=NUM_EPOCHS,
     batch_size=TRAIN_BATCH_SIZE,
     learning_rate=LEARNING_RATE,
@@ -959,7 +961,7 @@ def evaluate_single_result(task_name, result):
 
 
 
-def test_multitask_model(model, tokenizer, device, test_samples=None):
+def test_multitask_model(model, tokenizer, device, test_samples=None, test_output_dir=TEST_OUTPUT_DIR):
     """Test the trained model on all test samples"""
     if test_samples is None:
         test_samples = load_all_test_data_from_folders(DATA_ROOT)
@@ -967,6 +969,10 @@ def test_multitask_model(model, tokenizer, device, test_samples=None):
     if not test_samples:
         print("ERROR: No test samples were loaded.")
         return
+    
+    if TEST_PARTIAL is not None:
+        test_samples = test_samples[:TEST_PARTIAL + 1]
+        print(f"NOTE: Testing on a partial set of {TEST_PARTIAL} samples")
     
     print("\n" + "="*60)
     print("TESTING MULTI-TASK MODEL")
@@ -1091,9 +1097,9 @@ def test_multitask_model(model, tokenizer, device, test_samples=None):
     }
     
     # Save detailed results to file
-    results_file = os.path.join(TEST_OUTPUT_DIR, 'inst_tuning_results_detailed.json')
-    results_summary_file = os.path.join(TEST_OUTPUT_DIR, 'inst_tuning_results_summary.txt')
-    os.makedirs(TEST_OUTPUT_DIR, exist_ok=True)
+    results_file = os.path.join(test_output_dir, 'inst_tuning_results_detailed.json')
+    results_summary_file = os.path.join(test_output_dir, 'inst_tuning_results_summary.txt')
+    os.makedirs(test_output_dir, exist_ok=True)
 
     with open(results_file, 'w', encoding='utf-8') as f:
         json.dump(detailed_results, f, indent=2, ensure_ascii=False)
@@ -1155,8 +1161,8 @@ def test_multitask_model(model, tokenizer, device, test_samples=None):
                     f.write(f"Output: {result['model_output'][:200]}...\n")
                     f.write("-" * 20 + "\n")
 
-    generate_latex_table(task_summaries)
-    generate_radar_plot(task_summaries)
+    generate_latex_table(task_summaries, output_path=os.path.join(test_output_dir, "results_table.tex"))
+    generate_radar_plot(task_summaries, output_path=os.path.join(test_output_dir, "results_radar_plot.png"))
 
     # Show summary on screen
     print(f"\n" + "="*60)
@@ -1225,7 +1231,7 @@ def save_parameter_settings(output_dir):
             "GENERATION_REPETITION_PENALTY": GENERATION_REPETITION_PENALTY,
             "GENERATION_NO_REPEAT_NGRAM_SIZE": GENERATION_NO_REPEAT_NGRAM_SIZE
         }
-        json.dump(params, f, indent=4)
+        json.dump(params, f, indent=2)
 
 def main():
     torch.cuda.empty_cache()
@@ -1282,17 +1288,18 @@ def main():
     
     if TEST_ONLY:
         # Only test existing model
+        test_only_output_dir = os.path.join("fine_tuned_multitask_models", TEST_ONLY_MODEL_SUBDIR)
         print("Test-only mode: Loading existing model")
-        if os.path.exists(OUTPUT_DIR):
-            model = T5ForConditionalGeneration.from_pretrained(OUTPUT_DIR)
-            tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR)
+        if os.path.exists(test_only_output_dir):
+            model = T5ForConditionalGeneration.from_pretrained(test_only_output_dir)
+            tokenizer = AutoTokenizer.from_pretrained(test_only_output_dir)
             # FOR OPT
             if torch.cuda.is_available():
                 model = model.to(device, non_blocking=True)
                 print("✓ Model moved to GPU with non-blocking transfer")
             else:
                 model = model.to(device)
-            test_multitask_model(model, tokenizer, device)
+            test_multitask_model(model, tokenizer, device, test_output_dir=os.path.join("outputs", f"{TEST_ONLY_MODEL_SUBDIR}{f'_partial_{TEST_PARTIAL}' if TEST_PARTIAL is not None else ''}"))
         else:
             print(f"Error: Model directory {OUTPUT_DIR} not found")
         return
@@ -1335,8 +1342,8 @@ def main():
     save_parameter_settings(OUTPUT_DIR)
     
     # Test the trained model
-    # print("\nTesting the trained multi-task model...")
-    # test_multitask_model(model, tokenizer, device)
+    print("\nTesting the trained multi-task model...")
+    test_multitask_model(model, tokenizer, device)
     
     print("\n" + "="*60)
     print("TRAINING COMPLETED SUCCESSFULLY!")
