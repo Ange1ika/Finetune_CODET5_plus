@@ -27,6 +27,7 @@ from transformers import (
     EarlyStoppingCallback,
 )
 from generate_radar_plot import generate_radar_plot
+from eval_utils import calculate_bleu_score
 # Execution Mode
 TEST_ONLY = True             # Set to True to only test existing model (no training)
 # When TEST_ONLY is True, choose which model to evaluate:
@@ -384,7 +385,15 @@ def evaluate_pass_at_k(results, k=1):
     correct = sum(r["correct"] for r in results)
     return pass_at_k(total, correct, k)
 
-
+def evaluate_bleu_score(results):
+    total_bleu = 0.0
+    for r in results:
+        reference = r["expected_output"]
+        hypothesis = r["model_output"]
+        bleu_score = calculate_bleu_score(reference, hypothesis, max_n=4, smooth_method='exp')
+        total_bleu += bleu_score
+    average_bleu = total_bleu / len(results) if results else 0.0
+    return average_bleu
 
 
 
@@ -806,6 +815,7 @@ def evaluate_task_results(task_name, results):
         pass_1 = evaluate_pass_at_k(results, 1)
         pass_5 = evaluate_pass_at_k(results, 5)
         pass_10 = evaluate_pass_at_k(results, 10)
+        bleu = evaluate_bleu_score(results)
 
         plausible = sum(
             1 for r in results
@@ -817,6 +827,7 @@ def evaluate_task_results(task_name, results):
             "pass@1": round(pass_1, 3),
             "pass@5": round(pass_5, 3),
             "pass@10": round(pass_10, 3),
+            "bleu": round(bleu, 3),
             "plausible_patches": plausible,
             "ci_95": [ci_low, ci_high],
             "target": "> 0.30"
