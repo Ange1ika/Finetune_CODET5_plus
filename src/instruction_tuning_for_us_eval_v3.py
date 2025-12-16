@@ -33,17 +33,21 @@ TEST_ONLY = True             # Set to True to only test existing model (no train
 # When TEST_ONLY is True, choose which model to evaluate:
 #   - "pretrained": load the base model from MODEL_NAME (no fine-tuning)
 #   - "finetuned": load the fine-tuned model from OUTPUT_DIR
-TEST_MODEL_SOURCE = "finetuned"   # or "finetuned"
+TEST_MODEL_SOURCE = "pretrained"   # or "finetuned"
 
 
 
 
 # Evaluation Settings
 # List of tasks to evaluate. Empty list = evaluate all tasks, or you can specify tasks like the following.
+# EVAL_TASKS = [
+#     "code_search",
+#     "clone_detection",
+#     "code_repair",
+#     "test_generation"
+# ]
+
 EVAL_TASKS = [
-    "code_search",
-    "clone_detection",
-    "code_repair",
     "test_generation"
 ]
 
@@ -87,6 +91,8 @@ NUM_EPOCHS = 5                # How many times to go through the entire dataset
 MAX_INPUT_LENGTH = 512        # Maximum tokens for input text (code/descriptions)
 MAX_TARGET_LENGTH = 512        # Maximum tokens for output text
 
+
+
 # Validation and Early Stopping
 EARLY_STOPPING_PATIENCE = 4   # Stop training if no improvement for this many evaluations
 EVAL_STEPS = 300              # Evaluate model performance every N training steps
@@ -94,12 +100,21 @@ SAVE_STEPS = 300              # Save model checkpoint every N steps
 VALIDATION_SIZE = 500         # Number of samples to use for validation
 
 # Text Generation Settings (for inference/testing)
+# finetune
+# GENERATION_MAX_LENGTH = 512
+# GENERATION_MIN_LENGTH = 0
+# GENERATION_NUM_BEAMS = 15
+# GENERATION_LENGTH_PENALTY = 1.0
+# GENERATION_REPETITION_PENALTY = 1.0
+# GENERATION_NO_REPEAT_NGRAM_SIZE = 0
+
+# pretrain
 GENERATION_MAX_LENGTH = 512
 GENERATION_MIN_LENGTH = 0
-GENERATION_NUM_BEAMS = 15
-GENERATION_LENGTH_PENALTY = 1.0
-GENERATION_REPETITION_PENALTY = 1.0
-GENERATION_NO_REPEAT_NGRAM_SIZE = 0
+GENERATION_NUM_BEAMS = 4
+GENERATION_LENGTH_PENALTY = 0.8
+GENERATION_REPETITION_PENALTY = 1.1
+GENERATION_NO_REPEAT_NGRAM_SIZE = 3
 
 def parse_index_from_text(text, valid_indices=None):
     """
@@ -472,17 +487,25 @@ def load_all_test_data_from_folders(data_root):
     # -------------------------
     # TEST GENERATION
     # -------------------------
-    testgen_path = os.path.join(data_root, "test_gen", "test.jsonl")
-    if os.path.exists(testgen_path):
-        for item in read_jsonl(testgen_path):
+
+    # TEST GENERATION (Bug detection evaluation uses repair pairs)
+    repair_path = os.path.join(data_root, "repair", "test.jsonl")
+    if os.path.exists(repair_path):
+        for item in read_jsonl(repair_path):
+            buggy = item["input"]
+            fixed = item["output"]
+
             all_samples.append({
                 "task": "test_generation",
                 "input": (
                     f"{TASK_PREFIXES['test_generation']}\n\n"
-                    f"CODE UNDER TEST:\n{item['source']}\n\n"
-                    "Write unit tests:"
+                    "CODE UNDER TEST:\n"
+                    f"{buggy}\n\n"
+                    "Write unit tests (assert-based, no external libs)."
                 ),
-                "expected_output": item["target"]
+                # 평가에 필요
+                "buggy_code": buggy,
+                "fixed_code": fixed,
             })
 
     print(f"Loaded {len(all_samples)} total test samples from all tasks.")
@@ -769,6 +792,55 @@ def execute_code_safely(code, timeout=5):
     except Exception as e:
         return False, "", str(e)
 
+def exec_program(code, timeout=2):
+    """
+    Load program code (buggy or fixed) into a namespace.
+    Returns: (ok, namespace, error_msg)
+    """
+    try:
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(timeout)
+
+        namespace = {}
+        exec(code, namespace)
+
+        return True, namespace, ""
+
+    except TimeoutError:
+        return False, None, "Program execution timeout"
+    except Exception as e:
+        return False, None, str(e)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+def exec_tests(test_code, namespace, timeout=2):
+    """
+    Execute generated test code in an existing namespace.
+    Returns: (passed, error_msg)
+    """
+    try:
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(timeout)
+
+        exec(test_code, namespace)
+
+        # no exception => test passed
+        return True, ""
+
+    except AssertionError as e:
+        return False, f"AssertionError: {e}"
+    except TimeoutError:
+        return False, "Test execution timeout"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+
 def evaluate_task_results(task_name, results):
     """
     Aggregate evaluation metrics for a specific task using the per-sample
@@ -839,25 +911,32 @@ def evaluate_task_results(task_name, results):
     #   Secondary: correctness / coverage
     # -----------------------
     if task_name == "test_generation":
-        pass_1 = evaluate_pass_at_k(results, 1)
-        pass_5 = evaluate_pass_at_k(results, 5)
-        pass_10 = evaluate_pass_at_k(results, 10)
+        n = len(results)
 
-        plausible = sum(
-            1 for r in results 
-            if r["model_output"].strip() and r["correct"]
+        pass_fixed = sum(1 for r in results if r.get("pass_fixed"))
+        bug_detected = sum(
+            1 for r in results
+            if r.get("pass_fixed") and r.get("fail_buggy")
         )
+        false_positive = sum(
+            1 for r in results
+            if r.get("pass_fixed") is False
+        )
+
+        bug_detection_rate = bug_detected / n if n else 0.0
+        valid_test_rate = pass_fixed / n if n else 0.0
+        false_positive_rate = false_positive / n if n else 0.0
+
+        ci_low, ci_high = wilson_confidence_interval(bug_detected, n)
 
         return {
             "samples": n,
-            "pass@1": round(pass_1, 3),
-            "pass@5": round(pass_5, 3),
-            "pass@10": round(pass_10, 3),
-            "plausible_patches": plausible,
+            "bug_detection@1": round(bug_detection_rate, 3),
+            "valid_test_rate": round(valid_test_rate, 3),
+            "false_positive_rate": round(false_positive_rate, 3),
             "ci_95": [ci_low, ci_high],
             "target": "> 0.30"
         }
-
 
 def generate_latex_table(metrics, output_path="results_table.tex"):
     with open(output_path, "w") as f:
@@ -873,8 +952,20 @@ def generate_latex_table(metrics, output_path="results_table.tex"):
             elif task == "clone_detection":
                 f.write(f"Clone Detection & F1 & {m['f1']} & [{m['ci_95'][0]}, {m['ci_95'][1]}] & {m['target']} \\\\\n")
 
-            elif task in ["code_repair", "test_generation"]:
-                f.write(f"{task.replace('_',' ').title()} & Pass@1 & {m['pass@1']} & [{m['ci_95'][0]}, {m['ci_95'][1]}] & {m['target']} \\\\\n")
+            elif task == "code_repair":
+                f.write(
+                    f"Code Repair & Pass@1 & {m['pass@1']} & "
+                    f"[{m['ci_95'][0]}, {m['ci_95'][1]}] & {m['target']} \\\\\n"
+                )
+                f.write(f"& BLEU & {m.get('bleu', 0.0)} & & \\\\\n")
+
+            elif task == "test_generation":
+                f.write(
+                    f"Test Generation & BugDetection@1 & {m['bug_detection@1']} & "
+                    f"[{m['ci_95'][0]}, {m['ci_95'][1]}] & {m['target']} \\\\\n"
+                )
+                f.write(f"& ValidTestRate & {m['valid_test_rate']} & & \\\\\n")
+                f.write(f"& FalsePositiveRate & {m['false_positive_rate']} & & \\\\\n")
 
         f.write("\\hline\\end{tabular}\n")
         f.write("\\caption{Multi-task evaluation results with 95\\% confidence intervals.}1\n")
@@ -939,13 +1030,40 @@ def evaluate_single_result(task_name, result):
 
     # 4) TEST GENERATION (Primary: BLEU, Secondary: correctness/coverage)
     if task_name == "test_generation":
-        try:
-            compile(pred, "<string>", "exec")
-            exec_ok, _, _ = execute_code_safely(pred)
-            is_correct = exec_ok
-            return is_correct, 1.0 if is_correct else 0.0
-        except Exception:
+        test_code = pred
+        buggy = result.get("buggy_code")
+        fixed = result.get("fixed_code")
+
+        if not buggy or not fixed:
             return False, 0.0
+
+        # ---- fixed version: must PASS ----
+        fixed_ok, fixed_ns, fixed_err = exec_program(fixed)
+        if not fixed_ok:
+            result["pass_fixed"] = False
+            result["fail_buggy"] = False
+            return False, 0.0
+
+        pass_fixed, fixed_test_err = exec_tests(test_code, fixed_ns)
+        result["pass_fixed"] = pass_fixed
+
+        if not pass_fixed:
+            # false positive / invalid test
+            result["fail_buggy"] = False
+            return False, 0.0
+
+        # ---- buggy version: must FAIL ----
+        buggy_ok, buggy_ns, buggy_err = exec_program(buggy)
+        if not buggy_ok:
+            result["fail_buggy"] = False
+            return False, 0.0
+
+        pass_buggy, buggy_test_err = exec_tests(test_code, buggy_ns)
+        fail_buggy = not pass_buggy
+        result["fail_buggy"] = fail_buggy
+
+        is_correct = pass_fixed and fail_buggy
+        return is_correct, 1.0 if is_correct else 0.0
 
     # Fallback for unknown tasks
     return False, 0.0
@@ -1026,6 +1144,10 @@ def test_multitask_model(model, tokenizer, device, test_samples=None):
                     'input_length': len(sample['input']),
                     'output_length': len(response)
                 }
+
+                if task_name == "test_generation":
+                    result["buggy_code"] = sample.get("buggy_code")
+                    result["fixed_code"] = sample.get("fixed_code")
                 
                 # Add correctness evaluation
                 is_correct, score = evaluate_single_result(task_name, result)
@@ -1066,6 +1188,8 @@ def test_multitask_model(model, tokenizer, device, test_samples=None):
             task_success = metrics["f1"]
         elif "pass@1" in metrics:
             task_success = metrics["pass@1"]
+        elif "bug_detection@1" in metrics:
+            task_success = metrics["bug_detection@1"]
         else:
             task_success = 0.0
 
@@ -1126,17 +1250,15 @@ def test_multitask_model(model, tokenizer, device, test_samples=None):
 
             elif "pass@1" in metrics:
                 if task_name == "code_repair":
-                    f.write(f"  BLEU: {metrics['bleu']:.3f}\n")  # ← 추가됨
+                    f.write(f"  BLEU: {metrics['bleu']:.3f}\n")  
                     f.write(f"  Pass@1: {metrics['pass@1']:.3f}\n")
                     f.write(f"  Pass@5: {metrics['pass@5']:.3f}\n")
                     f.write(f"  Pass@10: {metrics['pass@10']:.3f}\n")
                     f.write(f"  Plausible patches: {metrics['plausible_patches']}\n")
-                else:
-                    f.write(f"  Pass@1: {metrics['pass@1']:.3f}\n")
-                    f.write(f"  Pass@5: {metrics['pass@5']:.3f}\n")
-                    f.write(f"  Pass@10: {metrics['pass@10']:.3f}\n")
-                    f.write(f"  Plausible patches: {metrics['plausible_patches']}\n")
-
+                elif task_name == "test_generation":
+                    f.write(f"  BugDetection@1: {metrics['bug_detection@1']:.3f}\n")
+                    f.write(f"  ValidTestRate: {metrics['valid_test_rate']:.3f}\n")
+                    f.write(f"  FalsePositiveRate: {metrics['false_positive_rate']:.3f}\n")
         f.write("\n" + "="*80 + "\n")
         f.write("SAMPLE OUTPUTS (First 3 per task)\n")
         f.write("="*80 + "\n")
@@ -1190,11 +1312,10 @@ def test_multitask_model(model, tokenizer, device, test_samples=None):
                 print(f"    Pass@5: {metrics['pass@5']:.3f}")
                 print(f"    Pass@10: {metrics['pass@10']:.3f}")
                 print(f"    Plausible patches: {metrics['plausible_patches']}")
-            else:
-                print(f"    Pass@1: {metrics['pass@1']:.3f}")
-                print(f"    Pass@5: {metrics['pass@5']:.3f}")
-                print(f"    Pass@10: {metrics['pass@10']:.3f}")
-                print(f"    Plausible patches: {metrics['plausible_patches']}")
+            elif task_name == "test_generation":
+                print(f"    BugDetection@1: {metrics['bug_detection@1']:.3f}")
+                print(f"    ValidTestRate: {metrics['valid_test_rate']:.3f}")
+                print(f"    FalsePositiveRate: {metrics['false_positive_rate']:.3f}")
 
 
     print(f"\nDetailed results saved to:")

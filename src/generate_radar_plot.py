@@ -19,7 +19,7 @@ def generate_radar_plot(metrics, save_path="radar_plot.png"):
 
     if "test_generation" in metrics:
         tasks.append("Test Generation")
-        scores.append(metrics["test_generation"]["pass@1"])
+        scores.append(metrics["test_generation"]["bug_detection@1"])
 
     angles = np.linspace(0, 2*np.pi, len(scores), endpoint=False)
     scores += scores[:1]
